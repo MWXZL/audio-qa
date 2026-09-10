@@ -639,9 +639,12 @@ def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
 
 
 def find_media(path: Path) -> list[Path]:
+    """目录里的媒体文件（排除工具自己切出来的听辨工作副本，它们不是新素材）。"""
     if path.is_file():
         return [path]
-    return sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTS)
+    return sorted(p for p in path.iterdir()
+                  if p.is_file() and p.suffix.lower() in MEDIA_EXTS
+                  and not field_session.is_derived_workcopy(p))
 
 
 def watch(args: argparse.Namespace) -> int:

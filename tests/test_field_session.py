@@ -334,6 +334,23 @@ class FieldSessionTestCase(unittest.TestCase):
                  if line.startswith("| `raw_20260910_bug_03_r02.wav` |")][0]
         self.assertNotIn("| 甲 |", other)
 
+    def test_derived_workcopies_are_not_treated_as_evidence(self) -> None:
+        """按句切出的 wav 片段是派生工作副本：列进测量表会把 3 段素材变成 3 段 + 98 个片段。"""
+        self.assertTrue(field_session.is_derived_workcopy(Path("句_r05_01.wav")))
+        self.assertTrue(field_session.is_derived_workcopy(Path("语音片段_r04_49.wav")))
+        self.assertTrue(field_session.is_derived_workcopy(Path("字幕截图_r05_12.jpg")))
+        self.assertFalse(field_session.is_derived_workcopy(Path("raw_20260910_bug_03_r01.mka")))
+
+    def test_scan_ignores_derived_workcopies(self) -> None:
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        write_wav(directory / "语音片段_r01_01.wav", sine(1.0))
+        write_wav(directory / "句_r01_02.wav", sine(1.0))
+        result = self.session(directory)
+        text = result["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 执行次数：1（本目录内 1 个片段）", text)
+        self.assertNotIn("语音片段_r01_01", text)
+
 
 if __name__ == "__main__":
     unittest.main()

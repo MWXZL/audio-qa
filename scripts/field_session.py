@@ -32,6 +32,22 @@ NAME_PATTERN = re.compile(
 )
 CASE_PATTERN = re.compile(r"(bug_\d+|RC-\d+|C-\d+|compat_[a-z]+_c\d+)", re.IGNORECASE)
 VIDEO_EXTS = (".mkv", ".mp4", ".mov", ".avi", ".webm")
+# 工具自己切出来的**听辨工作副本**：按句切好的片段、按状态切好的字幕截图。
+# 它们是从同目录的录像/无损音轨派生的，不是独立证据——列进测量表会把「3 段素材」
+# 变成「3 段 + 98 个片段」，报告立刻失真（实测踩过：bug_04 的量表被 98 个 wav 灌满）。
+DERIVED_NAME_PREFIXES = ("句_", "语音片段_", "字幕截图_")
+
+
+def is_derived_workcopy(path: Path) -> bool:
+    """是不是工具派生的工作副本（不进测量、不进包）。纯函数。"""
+    return path.name.startswith(DERIVED_NAME_PREFIXES)
+
+
+def collect_evidence_files(directory: Path, exts: Sequence[str]) -> list[Path]:
+    """目录里真正算证据的媒体文件（排除派生工作副本）。"""
+    return [path for path in audio_qa.collect_files(directory, exts)
+            if not is_derived_workcopy(path)]
+
 
 
 def dedupe_takes(paths: Sequence[Path]) -> list[Path]:
@@ -71,6 +87,24 @@ def gap_entries(report: dict[str, Any]) -> list[dict[str, Any]]:
                 entries.append({"path": item["path"], **gap})
     entries.sort(key=lambda entry: (entry["path"], entry["time_s"]))
     return entries
+
+
+def gap_truncation(report: dict[str, Any]) -> str:
+    """哪些片段的时间间隙表被截断了（`measure.json` 每段只存前 20 处）。纯函数。
+
+    为什么要明说：表格看起来是完整的，实际只列了前 20 处——一段里有 61 处间隙时，
+    报告与测量数字会对不上，读者会以为漏检或以为表格就是全部。
+    """
+    parts: list[str] = []
+    for item in report["files"]:
+        for issue in item["issues"]:
+            if issue["check"] != "silence_gap":
+                continue
+            listed = len(issue["detail"].get("gaps", []))
+            total = int(issue["detail"].get("gap_count", listed))
+            if total > listed:
+                parts.append(f"`{item['path']}` 列出 {listed} / 实际 {total} 处")
+    return "；".join(parts)
 
 
 def naming_findings(report: dict[str, Any]) -> list[str]:
@@ -374,6 +408,14 @@ def render_skeleton(
             )
     else:
         lines.append("本批片段未检出段内静音间隙（达到设定下限的）。")
+    truncated = gap_truncation(report)
+    if truncated:
+        lines += [
+            "",
+            f"> **本表不完整**：{truncated}。`measure.json` 为了控制体积只保留每段前 20 处间隙，"
+            "完整处数见第二节的「段内间隙数」列；要逐条定性全部间隙，"
+            "用 `audio_qa.py scan --dropout-min-ms <下限>` 重新导出或直接看 `measure.json` 的计数。",
+        ]
     lines += [
         "",
         "## 四、结论（待填）",
@@ -441,7 +483,7 @@ def run_session(
     ffmpeg = audio_qa.find_ffmpeg(None)
     cfg = audio_qa.Thresholds(dropout_min_ms=dropout_min_ms)
     # 先合并「同一段的录像与无损音轨」，再送去测量：否则执行次数 / 复现率会翻倍。
-    deduped = dedupe_takes(audio_qa.collect_files(directory.resolve(), exts))
+    deduped = dedupe_takes(collect_evidence_files(directory.resolve(), exts))
     report = audio_qa.scan(
         root=directory.resolve(),
         cfg=cfg,
