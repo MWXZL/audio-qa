@@ -536,6 +536,10 @@ def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
     真实证据目录里写东西）。
     """
     directory = directory or target_dir(case_id, game)
+    # 防呆：把归档目录里的素材再喂给 process 会重复归档（实测踩过，一次生成 r04–r08）。
+    # 归档过的文件不需要再处理，直接拒绝，避免把目录越搞越乱。
+    if media.parent.resolve() == directory.resolve():
+        raise ValueError(f"「{media.name}」已经在归档目录里，不需要再处理（避免重复归档）")
     directory.mkdir(parents=True, exist_ok=True)
     index = next_index(directory, case_id)
     archived = directory / new_clip_name(case_id, index, media.suffix.lower())
@@ -889,8 +893,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     for media in targets:
         print(f"处理：{media}")
-        print_summary(process_one(media, args.case, args.game, ffmpeg, args.dropout_min_ms,
-                                  args.force, args.quiet))
+        try:
+            summary = process_one(media, args.case, args.game, ffmpeg, args.dropout_min_ms,
+                                  args.force, args.quiet)
+        except ValueError as exc:
+            print(f"  跳过：{exc}")
+            continue
+        print_summary(summary)
         print()
     print("下一步：填骨架两节 → 重建交付材料 → git 提交")
     return 0
