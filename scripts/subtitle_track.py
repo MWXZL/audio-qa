@@ -413,7 +413,7 @@ def baseline_tsv(states: Sequence[dict[str, Any]]) -> str:
         rows.append("\t".join((
             f"D-{index:02d}", "", "",
             f"{state['start']:.3f}", f"{state['end']:.3f}", "",
-            f"字幕原文见截图 {state.get('shot', '—')}；语音起止待填",
+            f"字幕原文见截图 {state.get('shot', '—')}；语音起止按听辨填写",
         )))
     return "\n".join(rows) + "\n"
 
