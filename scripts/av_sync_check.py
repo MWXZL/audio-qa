@@ -41,11 +41,63 @@ for extra in (ROOT, ROOT / "scripts"):
 import audio_qa  # noqa: E402
 
 MIN_ACTIVITY_S = 0.15      # 活动段短于此视为噪声
+MIN_VOICE_S = 0.8          # 语音句短于此更像音效
+MAX_VOICE_S = 12.0         # 语音句长于此更像音乐段
 MIN_SILENCE_SHARE = 0.05   # 静音占比低于它，说明素材一直有声，活动法不适用
 DEFAULT_NOISE_DB = -50.0   # 静音判定的噪声门限
 DEFAULT_SILENCE_S = 0.12   # 静音判定的最短时长（秒）
 DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):([\d.]+)")
 SILENCE_RE = re.compile(r"silence_(start|end):\s*(-?[\d.]+)")
+
+
+def voice_candidates(segments: Sequence[dict[str, float]], min_s: float = MIN_VOICE_S,
+                     max_s: float = MAX_VOICE_S) -> list[dict[str, float]]:
+    """把活动段按「像不像一句人声」筛一遍。纯函数。
+
+    为什么必须筛：BGM 常驻的素材里没有真正的静音，活动段只能在**抬高门限**后才分得出来，
+    于是音乐重音、打击声也会各成一段。人声句的长度通常落在 0.8–12 s，更短的是音效、
+    更长的是音乐段。筛出来的仍只是**候选**——报告里不许写成「已确认的语音」。
+    """
+    return [dict(segment) for segment in segments
+            if min_s <= segment["end"] - segment["start"] <= max_s]
+
+
+def cut_evidence(media: Path, ffmpeg: str, rows: Sequence[dict[str, Any]], out_dir: Path,
+                 prefix: str, margin: float = 0.4) -> int:
+    """给每一段候选语音留一张截图与一段音频（截图用来读文本，音频用来听对应关系）。"""
+    written = 0
+    for index, row in enumerate(rows, 1):
+        at = row["start"] + 0.2
+        shot = out_dir / f"语音截图_{prefix}{index:02d}.jpg"
+        clip = out_dir / f"语音片段_{prefix}{index:02d}.wav"
+        start = max(0.0, row["start"] - margin)
+        length = (row["end"] - row["start"]) + margin * 2
+        done_shot = subprocess.run(
+            [ffmpeg, "-v", "error", "-ss", f"{at:.3f}", "-i", str(media), "-frames:v", "1",
+             "-vf", "scale=1280:-2", "-q:v", "4", "-y", str(shot)], capture_output=True)
+        done_clip = subprocess.run(
+            [ffmpeg, "-v", "error", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(media),
+             "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", "-y", str(clip)],
+            capture_output=True)
+        if done_shot.returncode == 0 and shot.is_file() and shot.stat().st_size > 0:
+            row["shot"] = shot.name
+            written += 1
+        if done_clip.returncode == 0 and clip.is_file() and clip.stat().st_size > 0:
+            row["clip"] = clip.name
+    return written
+
+
+def voice_baseline_tsv(rows: Sequence[dict[str, Any]]) -> str:
+    """语音侧基线：`asr_align` 的表头，**语音起止预填**，字幕与文本待人工补。"""
+    header = "\t".join(("句号", "语音起", "语音止", "字幕出现", "字幕消失", "字幕原文", "备注"))
+    lines = [header]
+    for index, row in enumerate(rows, 1):
+        lines.append("\t".join((
+            f"V-{index:02d}", f"{row['start']:.3f}", f"{row['end']:.3f}", "", "", "",
+            f"截图 {row.get('shot', '—')}（画面里应有对应文本）；音频 {row.get('clip', '—')}",
+        )))
+    return "\n".join(lines) + "\n"
+
 
 
 def parse_silences(stderr: str) -> tuple[float, list[dict[str, float]]]:
@@ -220,6 +272,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="silencedetect 的噪声门限（默认 -50 dB）")
     parser.add_argument("--silence-s", type=float, default=DEFAULT_SILENCE_S,
                         help="判句间静音的最短时长（秒，默认 0.12）")
+    parser.add_argument("--crops", action="store_true",
+                        help="给每段候选语音留一张截图（用来读文本）")
+    parser.add_argument("--clips", action="store_true",
+                        help="给每段候选语音切一段音频（用来听对应关系）")
+    parser.add_argument("--min-voice-s", type=float, default=MIN_VOICE_S,
+                        help="候选语音的最短时长（秒）")
+    parser.add_argument("--max-voice-s", type=float, default=MAX_VOICE_S,
+                        help="候选语音的最长时长（秒）")
+    parser.add_argument("--tag", default="", help="产出文件名前缀（多段素材时区分用）")
     return parser
 
 
@@ -243,13 +304,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     usable = result["silence_share"] >= MIN_SILENCE_SHARE
     args.out.mkdir(parents=True, exist_ok=True)
     stem = args.media.stem
+    voices = voice_candidates(segments, args.min_voice_s, args.max_voice_s)
+    if args.crops or args.clips:
+        cut_evidence(args.media, ffmpeg, voices, args.out, f"{args.tag or ''}")
+        (args.out / f"{stem}_语音基线.tsv").write_text(voice_baseline_tsv(voices),
+                                                       encoding="utf-8")
     (args.out / f"{stem}_交叉检查.json").write_text(
         json.dumps({"file": args.media.name, "duration": duration, "noise_db": args.noise_db,
                     "silence_s": args.silence_s, "silences": silences,
-                    "activity_segments": segments, "usable": usable, **result},
+                    "activity_segments": segments, "usable": usable,
+                    "voice_candidates": voices, **result},
                    ensure_ascii=False, indent=2), encoding="utf-8")
     (args.out / f"{stem}_交叉检查.md").write_text(
         render(result, args.media, args.timeline, args.noise_db, usable), encoding="utf-8")
+    print(f"候选语音段（{args.min_voice_s:g}–{args.max_voice_s:g} s）：{len(voices)} 条")
     print(f"文本状态 {result['text_states']} 个 · 活动段 {result['activity_segments']} 个 · "
           f"静音占比 {result['silence_share'] * 100:.0f}% · 需回听候选 {len(result['findings'])} 条")
     if result["offset_median_ms"] is not None:

@@ -456,7 +456,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     args.out.mkdir(parents=True, exist_ok=True)
     for index, item in enumerate(media, 1):
-        prefix = f"{index:02d}_" if len(media) > 1 else ""
+        # 目录里有多段录像时，产出要带片段名，否则三段截图混在一起分不清是哪一段的
+        prefix = f"{item.stem}_" if len(media) > 1 else ""
         try:
             result = process(item, args.out, ffmpeg, args, prefix)
         except RuntimeError as exc:
