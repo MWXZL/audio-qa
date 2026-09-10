@@ -131,11 +131,11 @@ def keyframe_plan(gaps: list[dict], duration_s: float) -> list[tuple[str, float]
 
 
 def extract_frames(media: Path, plan: list[tuple[str, float]], out_dir: Path,
-                   ffmpeg: str) -> list[Path]:
+                   ffmpeg: str, prefix: str = "keyframe_") -> list[Path]:
     """按计划截帧；文件没有视频轨时静默返回空列表（脚本会提示补截图）。"""
     written: list[Path] = []
     for label, at in plan:
-        target = out_dir / f"keyframe_{label}.png"
+        target = out_dir / f"{prefix}{label}.png"
         done = subprocess.run(
             [ffmpeg, "-y", "-loglevel", "error", "-ss", f"{at:.3f}", "-i", str(media),
              "-frames:v", "1", "-q:v", "2", str(target)],
@@ -331,6 +331,56 @@ def fill_environment(skeleton: Path, values: dict[str, str]) -> list[str]:
     if filled:
         skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return filled
+
+
+def refresh_keyframes(directory: Path, ffmpeg: str, case_id: str) -> list[Path]:
+    """按 measure.json 里每段各自的间隙重新截帧，并重写骨架的关键帧小节。
+
+    为什么要能重跑：间隙列表会随重新测量而变化（例如刚补测了一段），
+    帧文件和骨架必须跟着更新，否则报告里会指向不存在的图或过时的时间点。
+    命名带上片段名，避免「间隙01 到底是哪一段的」这种歧义。
+    """
+    measure_path = directory / "measure.json"
+    if not measure_path.is_file():
+        return []
+    report = json.loads(measure_path.read_text(encoding="utf-8"))
+    for stale in list(directory.glob("keyframe_*.png")):
+        if "_现场记录" not in stale.name and stale.name.count("_") < 3:
+            stale.unlink()   # 清掉旧命名（不含片段名）的帧，避免一处间隙两张图
+
+    written: list[Path] = []
+    for item in report["files"]:
+        stem = Path(item["path"]).stem
+        media = next((directory / f"{stem}{ext}" for ext in (".mkv", ".mp4", ".mov", ".mka")
+                      if (directory / f"{stem}{ext}").is_file()), None)
+        if media is None:
+            continue
+        gaps = [gap for issue in item["issues"] if issue["check"] == "silence_gap"
+                for gap in issue["detail"].get("gaps", [])]
+        plan = keyframe_plan(gaps, item["duration_s"])
+        written += extract_frames(media, plan, directory, ffmpeg, prefix=f"keyframe_{stem}_")
+
+    if written:
+        rewrite_keyframe_section(directory / f"{case_id}_现场记录.md", written)
+    return written
+
+
+def rewrite_keyframe_section(skeleton: Path, frames: list[Path]) -> None:
+    """重写骨架的关键帧小节（旧的删掉，写一份新的）。"""
+    if not skeleton.is_file():
+        return
+    text = skeleton.read_text(encoding="utf-8")
+    marker = "## 关键帧"
+    if marker in text:
+        head = text[: text.index(marker)].rstrip()
+        lines = [head, "", marker + "（自动截取，对应录制时间点）", ""]
+    else:
+        lines = [text.rstrip(), "", marker + "（自动截取，对应录制时间点）", ""]
+    for frame in frames:
+        lines.append(f"- `{frame.name}`")
+    lines += ["", "> 文件名里带片段名（`r01`/`r02`/`r03`）与间隙序号；"
+              "画面内容仍需你本人确认它是否足以证明「触发动作 / 现象」。", ""]
+    skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
@@ -581,6 +631,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                  help="绑定录制与处理：按回车开始/停止，停录后自动处理（需 OBS 已开 WebSocket）")
     auto_parser.add_argument("--takes", type=int, default=3, help="本次要录几段（默认 3，对应 r01–r03）")
 
+    sub.add_parser("keyframes", parents=[common],
+                   help="按当前 measure.json 重新截取关键帧并重写骨架的关键帧小节")
+
     shot = sub.add_parser("screenshot", help="让 OBS 截一张关键帧并归档（需 obs_control 的 IPC 已就绪）")
     shot.add_argument("--case", required=True)
     shot.add_argument("--game", default=DEFAULT_GAME)
@@ -591,6 +644,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "auto":
         return run_auto(args)
+
+    if args.command == "keyframes":
+        directory = target_dir(args.case, args.game)
+        if not directory.is_dir():
+            print(f"用例目录不存在：{directory}", file=sys.stderr)
+            return 2
+        if ffmpeg is None:
+            print("需要 ffmpeg 才能截帧", file=sys.stderr)
+            return 2
+        frames = refresh_keyframes(directory, ffmpeg, args.case)
+        print(f"已截取 {len(frames)} 张关键帧（按片段名与间隙序号命名）")
+        for frame in frames:
+            print("  ", frame.name)
+        print(f"骨架关键帧小节已重写：{directory / (args.case + '_现场记录.md')}")
+        return 0
 
     if args.command == "watch":
         return watch(args)
