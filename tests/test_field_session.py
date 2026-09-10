@@ -103,6 +103,13 @@ class FieldSessionTestCase(unittest.TestCase):
         text = self.session(directory)["skeleton"].read_text(encoding="utf-8")
         self.assertNotIn("命名提醒", text)
 
+    def test_audio_only_names_are_recognised(self) -> None:
+        """纯音频方案下归档出来的是 .mka/.m4a——命名规则必须认，否则会被误报不合规。"""
+        for name in ("raw_20260910_bug_03_r01.mka", "raw_20260910_bug_03_r02.m4a",
+                     "raw_20260910_bug_03_r03.flac", "raw_20260910_bug_03_r04.mkv"):
+            self.assertIsNotNone(field_session.NAME_PATTERN.match(name), name)
+        self.assertIsNone(field_session.NAME_PATTERN.match("take.mka"))
+
     def test_clean_batch_states_no_gap_instead_of_silence(self) -> None:
         directory = self.root / "bug_05_occlusion"
         write_wav(directory / "raw_20260910_bug_05_r01.wav", sine(1.5))

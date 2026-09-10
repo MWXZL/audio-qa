@@ -26,7 +26,10 @@ import audio_qa  # noqa: E402
 
 DEFAULT_EXTS = "mkv,mp4,mov,mka,m4a,wav,flac"
 # 现场命名规则（见 采集计划 第五节）
-NAME_PATTERN = re.compile(r"^(raw_\d{8}_|[a-z]+_\d{8}_|\d{4}-\d{2}-\d{2}_).*\.(mkv|mp4|mov|wav|flac)$", re.IGNORECASE)
+NAME_PATTERN = re.compile(
+    r"^(raw_\d{8}_|[a-z]+_\d{8}_|\d{4}-\d{2}-\d{2}_).*\.(mkv|mp4|mov|mka|m4a|wav|flac|ogg)$",
+    re.IGNORECASE,
+)
 CASE_PATTERN = re.compile(r"(bug_\d+|RC-\d+|C-\d+|compat_[a-z]+_c\d+)", re.IGNORECASE)
 
 
