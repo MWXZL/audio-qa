@@ -62,6 +62,32 @@ class PickWindowItemTestCase(unittest.TestCase):
         self.assertNotIn("obs64.exe", picked or "")
 
 
+class FullscreenDetectionTestCase(unittest.TestCase):
+    def test_window_covering_screen_is_fullscreen(self) -> None:
+        self.assertTrue(obs_setup.looks_fullscreen((0, 0, 1920, 1080), (1920, 1080)))
+
+    def test_borderless_window_with_tiny_gap_still_counts(self) -> None:
+        self.assertTrue(obs_setup.looks_fullscreen((0, 0, 1919, 1079), (1920, 1080)))
+
+    def test_windowed_game_is_not_fullscreen(self) -> None:
+        """1600x900 的窗口在 1920x1080 屏幕上不算全屏——此时必须用窗口捕获，
+        否则 game_capture 的 any_fullscreen 会录到黑屏。"""
+        self.assertFalse(obs_setup.looks_fullscreen((100, 50, 1700, 950), (1920, 1080)))
+
+
+class VideoCandidatesTestCase(unittest.TestCase):
+    def test_non_fullscreen_tries_display_capture_first(self) -> None:
+        """原神窗口/游戏采集被反作弊挡住，非全屏时必须先试显示器采集。"""
+        self.assertEqual(obs_setup.video_candidates(False)[0], "monitor_capture")
+
+    def test_fullscreen_tries_game_capture_first(self) -> None:
+        self.assertEqual(obs_setup.video_candidates(True)[0], "game_capture")
+
+    def test_display_capture_is_always_available_as_fallback(self) -> None:
+        self.assertIn("monitor_capture", obs_setup.video_candidates(True))
+        self.assertIn("monitor_capture", obs_setup.video_candidates(False))
+
+
 class SettingsShapeTestCase(unittest.TestCase):
     def test_video_source_does_not_double_capture_audio(self) -> None:
         """画面源必须关掉自己的音频采集，否则声音会重复。"""

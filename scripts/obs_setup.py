@@ -93,6 +93,53 @@ def pick_window_item(items: list[dict[str, Any]], pattern: str) -> str | None:
     return None
 
 
+def looks_fullscreen(rect: tuple[int, int, int, int], screen: tuple[int, int],
+                     tolerance: int = 4) -> bool:
+    """窗口矩形是否铺满整个屏幕（纯函数，便于测试）。
+
+    这决定画面源用哪种模式：铺满屏幕可用 game_capture 的 any_fullscreen，
+    否则必须指定窗口——**用错模式的表现是录出来全黑**，属于最难自查的一类错误。
+    """
+    left, top, right, bottom = rect
+    width, height = screen
+    return (right - left) >= width - tolerance and (bottom - top) >= height - tolerance
+
+
+def game_window_rect(title_pattern: str) -> tuple[int, int, int, int] | None:
+    """按标题找可见顶层窗口的矩形（仅 Windows）。"""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, int, int, int]] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _lparam):  # noqa: ANN001
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length:
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            if title_pattern.lower() in buffer.value.lower() and user32.IsWindowVisible(hwnd):
+                rect = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                found.append((rect.left, rect.top, rect.right, rect.bottom))
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found[0] if found else None
+
+
+def screen_size() -> tuple[int, int]:
+    if sys.platform != "win32":
+        return (0, 0)
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    return (user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+
+
 def profile_params_for(mode: str) -> tuple[tuple[str, str, str], ...]:
     """按输出模式（Simple / Advanced）给出正确的参数位置。
 
@@ -122,13 +169,48 @@ def profile_params_for(mode: str) -> tuple[tuple[str, str, str], ...]:
     ) + common
 
 
+def source_screenshot_size(client: "ObsClient", source_name: str, width: int = 480) -> int:
+    """让 OBS 截一张源画面，返回 PNG 字节数。黑屏/纯色会非常小（几 KB）。"""
+    data = client.call("GetSourceScreenshot", sourceName=source_name,
+                       imageFormat="png", imageWidth=width)
+    return len(base64.b64decode(data.get("imageData", "").split(",", 1)[-1]))
+
+
+def monitor_value(client: "ObsClient", input_name: str) -> str | None:
+    """显示器的属性名在不同版本里是 monitor_id（新版）或 monitor（旧版），两个都试。"""
+    for property_name in ("monitor_id", "monitor"):
+        try:
+            items = client.call("GetInputPropertiesListPropertyItems",
+                                inputName=input_name, propertyName=property_name).get("propertyItems", [])
+        except Exception:
+            continue
+        for item in items:
+            if item.get("itemEnabled", True) and item.get("itemValue"):
+                return str(item["itemValue"])
+    return None
+
+
+def video_candidates(fullscreen: bool) -> list[str]:
+    """画面采集方式的尝试顺序（纯函数，便于测试）。
+
+    实测结论（原神 PC）：
+    - game_capture / window_capture 的图形钩子会被反作弊挡住，源尺寸为 0x0、截图为黑；
+    - monitor_capture 走 DXGI 桌面复制、不注入游戏进程，实测 2560x1440、截图 30 KB 正常。
+
+    所以若非全屏，**先试显示器采集**；全屏时 game_capture 有机会成功，放第一位。
+    """
+    if fullscreen:
+        return ["game_capture", "monitor_capture", "window_capture"]
+    return ["monitor_capture", "window_capture", "game_capture"]
+
+
 class ObsClient:
     """极简 obs-websocket v5 客户端：只做请求/响应，够用即可。"""
 
     def __init__(self, url: str = WS_URL) -> None:
         import websocket  # websocket-client
 
-        self._ws = websocket.create_connection(url, timeout=8)
+        self._ws = websocket.create_connection(url, timeout=30)
         hello = json.loads(self._ws.recv())
         if hello.get("op") != 0:
             raise RuntimeError(f"未收到 Hello：{hello}")
@@ -210,43 +292,134 @@ def configure(client: ObsClient) -> list[str]:
 
     inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
 
-    window_value = None
-    try:
-        probe = client.call("GetInputPropertiesListPropertyItems",
-                            inputName=(AUDIO_SOURCE if AUDIO_SOURCE in inputs else VIDEO_SOURCE),
-                            propertyName="window")
-        window_value = pick_window_item(probe.get("propertyItems", []), PROCESS_PATTERN)
-    except Exception as exc:
-        notes.append(f"!! 无法枚举窗口列表：{exc}")
+    # 清掉调试时随手建的临时源，避免它们混进录像画面
+    for name in [n for n in inputs if n.startswith(("_临时", "_调试"))]:
+        client.call("RemoveInput", inputName=name)
+        notes.append(f"清理临时源「{name}」")
+        inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
 
-    if VIDEO_SOURCE in inputs:
-        client.call("SetInputSettings", inputName=VIDEO_SOURCE,
-                    inputSettings=VIDEO_SETTINGS_WINDOWED if window_value else VIDEO_SETTINGS,
-                    overlay=True)
-    else:
-        settings = dict(VIDEO_SETTINGS_WINDOWED if window_value else VIDEO_SETTINGS)
-        if window_value:
-            settings["window"] = window_value
-        client.call("CreateInput", sceneName=SCENE_NAME, inputName=VIDEO_SOURCE,
-                    inputKind="game_capture", inputSettings=settings, sceneItemEnabled=True)
-    notes.append(f"画面源 {VIDEO_SOURCE}：{'指定窗口 ' + window_value if window_value else '捕获任何全屏应用'}")
-
-    audio_settings: dict[str, Any] = {}
-    if window_value:
-        audio_settings["window"] = window_value
-    if AUDIO_SOURCE in inputs:
-        if audio_settings:
-            client.call("SetInputSettings", inputName=AUDIO_SOURCE,
-                        inputSettings=audio_settings, overlay=True)
-    else:
+    # 声音源：先建出来——窗口/进程列表只有在源存在之后才能查询
+    if AUDIO_SOURCE not in inputs:
         client.call("CreateInput", sceneName=SCENE_NAME, inputName=AUDIO_SOURCE,
-                    inputKind="wasapi_process_output_capture", inputSettings=audio_settings,
+                    inputKind="wasapi_process_output_capture", inputSettings={},
                     sceneItemEnabled=False)
+        inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
+        notes.append(f"新建声音源「{AUDIO_SOURCE}」")
+
+    # 从窗口列表里锁定游戏进程；画面源与声音源共用同一个值
+    window_value = None
+    for probe_name in (AUDIO_SOURCE, VIDEO_SOURCE):
+        if probe_name not in inputs:
+            continue
+        try:
+            probe = client.call("GetInputPropertiesListPropertyItems",
+                                inputName=probe_name, propertyName="window")
+            window_value = pick_window_item(probe.get("propertyItems", []), PROCESS_PATTERN)
+            if window_value:
+                notes.append(f"从「{probe_name}」的窗口列表锁定目标进程：{window_value}")
+                break
+        except Exception as exc:
+            notes.append(f"（{probe_name} 的窗口列表不可查：{exc}）")
+    if window_value is None:
+        notes.append("!! 没在窗口列表里找到目标进程：确认游戏在运行且有声音，然后重跑 configure")
+
+    if window_value:
+        client.call("SetInputSettings", inputName=AUDIO_SOURCE,
+                    inputSettings={"window": window_value}, overlay=True)
+        notes.append(f"声音源 {AUDIO_SOURCE} → 只抓该进程音频")
     try:
         client.call("SetInputAudioTracks", inputName=AUDIO_SOURCE, inputAudioTracks=TRACK_ONE_ONLY)
         notes.append(f"声音源 {AUDIO_SOURCE}：只写轨道 1")
     except Exception as exc:
         notes.append(f"!! 音轨设置失败：{exc}")
+
+    # 画面源：按窗口是否铺满屏幕选种类，**建源时就把窗口值带上**，并且**回头验证**。
+    # 实测教训：window 为空字符串时 OBS 会把窗口采集源丢掉——API 报成功但源并不存在，
+    # 只信返回值就会得到「配好了」的假象，最后录出全黑。
+    rect = game_window_rect("原神")
+    fullscreen = rect is not None and looks_fullscreen(rect, screen_size())
+    candidates = video_candidates(fullscreen)
+    notes.append(f"游戏窗口 {rect} / 屏幕 {screen_size()} → 候选捕获方式 {candidates}")
+
+    for kind in candidates:
+        if VIDEO_SOURCE in inputs and inputs[VIDEO_SOURCE].get("inputKind") != kind:
+            client.call("RemoveInput", inputName=VIDEO_SOURCE)
+            inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
+            notes.append(f"移除旧画面源，改用 {kind}")
+        if kind == "game_capture":
+            settings: dict[str, Any] = dict(VIDEO_SETTINGS)
+        elif kind == "window_capture":
+            settings = {"window": window_value or "", "method": 2, "priority": 2,
+                        "cursor": False, "client_area": False}
+        else:
+            settings = {"capture_cursor": False}
+        try:
+            if VIDEO_SOURCE in inputs:
+                client.call("SetInputSettings", inputName=VIDEO_SOURCE,
+                            inputSettings=settings, overlay=True)
+            else:
+                client.call("CreateInput", sceneName=SCENE_NAME, inputName=VIDEO_SOURCE,
+                            inputKind=kind, inputSettings=settings, sceneItemEnabled=True)
+            if kind == "monitor_capture":
+                # 源刚建好时属性列表还没就绪（只返回 DUMMY），必须等真实显示器出现再取值
+                value = None
+                for _ in range(8):
+                    value = monitor_value(client, VIDEO_SOURCE)
+                    if value:
+                        break
+                    time.sleep(0.5)
+                if value:
+                    client.call("SetInputSettings", inputName=VIDEO_SOURCE,
+                                inputSettings={"monitor_id": value}, overlay=True)
+                    notes.append(f"采集显示器 → {value.split('#')[1] if '#' in value else value}")
+                    time.sleep(1.5)   # 等第一次桌面复制出来，否则截图会失败
+                else:
+                    notes.append("!! 没等到可用的显示器列表")
+        except Exception as exc:
+            notes.append(f"!! {kind} 设置失败：{exc}")
+            continue
+
+        inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
+        if VIDEO_SOURCE not in inputs:
+            notes.append(f"!! OBS 没保留 {kind} 源（窗口值为空时会被丢弃），换下一种方式")
+            continue
+        size = 0
+        last_error = ""
+        for _attempt in range(4):   # 首帧可能要等一会儿才渲染出来
+            try:
+                size = source_screenshot_size(client, VIDEO_SOURCE)
+                last_error = ""
+            except Exception as exc:
+                size = 0
+                last_error = str(exc)[:60]
+            if size > 20000:
+                break
+            time.sleep(1.0)
+        if size <= 20000:
+            notes.append(f"!! {kind} 画面仍不可用（截图 {size} 字节{('，' + last_error) if last_error else ''}），换下一种方式")
+            try:
+                client.call("RemoveInput", inputName=VIDEO_SOURCE)
+                inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
+            except Exception:
+                pass
+            continue
+        if size > 20000:
+            notes.append(f"画面源 {VIDEO_SOURCE} = {kind} · 源截图 {size // 1024} KB → 有画面 ✓")
+            try:
+                item_id = client.call("GetSceneItemId", sceneName=SCENE_NAME,
+                                      sourceName=VIDEO_SOURCE)["sceneItemId"]
+                client.call("SetSceneItemTransform", sceneName=SCENE_NAME, sceneItemId=item_id,
+                            sceneItemTransform={"positionX": 0, "positionY": 0,
+                                                "boundsType": "OBS_BOUNDS_SCALE_INNER",
+                                                "boundsAlignment": 0,
+                                                "boundsWidth": 1920, "boundsHeight": 1080})
+                notes.append("画面已缩放到 1920x1080 画布（避免被裁切）")
+            except Exception as exc:
+                notes.append(f"（画面缩放未设置：{exc}）")
+            break
+        notes.append(f"画面源 {kind} 的源截图只有 {size} 字节（黑屏/纯色），换下一种方式")
+        client.call("RemoveInput", inputName=VIDEO_SOURCE)
+        inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
 
     # 桌面音频若不慎存在，静音掉，避免系统通知混进游戏轨道
     for name, item in inputs.items():

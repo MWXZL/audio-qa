@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 import audio_qa  # noqa: E402
 
 SILENT_DBFS = -60.0          # 低于此值视为整段静音
+QUIET_LUFS = -45.0           # 低于此值视为「有信号但电平异常低」，多半是音量没开
 EXPECTED_RATE = 48000
 MIN_DURATION_S = 5.0
 
@@ -59,6 +60,10 @@ def check(path: Path, ffmpeg: str | None) -> tuple[str, list[str], list[str], di
     if audio.sample_rate != EXPECTED_RATE:
         problems.append(f"采样率 {audio.sample_rate} Hz，不是 48 kHz：与判据默认值不一致")
         hints.append("把输出设备与 OBS 的采样率都设为 48 kHz，避免重采样带来的额外不确定性")
+    if loudness is not None and loudness < QUIET_LUFS:
+        # 电平极低的「有声音」比整段静音更隐蔽：静音会被一眼看出，这个不会。
+        problems.append(f"响度只有 {loudness:.1f} LUFS（正常游戏音频约 -20 ~ -30）：能录到信号，但电平异常低")
+        hints.append("依次检查：系统音量合成器里该进程的滑条 → 游戏内「音频」设置的主音量 → 输出设备本身")
     if audio.duration_s < MIN_DURATION_S:
         problems.append(f"时长只有 {audio.duration_s:.1f} s：太短，录不到 10 秒环境底噪")
         hints.append("每段素材前后各留 10 秒底噪（见 RECORDING_SCRIPTS.md 的模板）")

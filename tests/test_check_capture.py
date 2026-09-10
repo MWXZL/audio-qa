@@ -77,6 +77,21 @@ class CheckCaptureTestCase(unittest.TestCase):
         _verdict, problems = self.verdict(path)
         self.assertTrue(any("太短" in item for item in problems))
 
+    def test_quiet_recording_warns_about_level(self) -> None:
+        """能录到信号但电平极低，比整段静音更隐蔽——必须单独提示。
+
+        响度需要 ffmpeg 才能测；没有 ffmpeg 的环境直接跳过，而不是假装通过。
+        """
+        import audio_qa  # noqa: PLC0415
+
+        ffmpeg = audio_qa.find_ffmpeg(None)
+        if ffmpeg is None:
+            self.skipTest("需要 ffmpeg 才能测量响度")
+        path = write_wav(self.root / "quiet.wav", channels=2, seconds=6.0, amplitude=0.0008)
+        verdict, problems, _hints, _measure = check_capture.check(path, ffmpeg)
+        self.assertEqual(verdict, "有警告但可用")
+        self.assertTrue(any("LUFS" in item for item in problems))
+
     def test_missing_file_exits_two(self) -> None:
         self.assertEqual(check_capture.main([str(self.root / "nope.wav")]), 2)
 
