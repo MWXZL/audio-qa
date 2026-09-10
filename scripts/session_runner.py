@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
+
 
 ROOT = Path(__file__).resolve().parents[1]
 for extra in (ROOT, ROOT / "scripts"):
@@ -361,7 +364,9 @@ def refresh_keyframes(directory: Path, ffmpeg: str, case_id: str) -> list[Path]:
         written += extract_frames(media, plan, directory, ffmpeg, prefix=f"keyframe_{stem}_")
 
     if written:
-        rewrite_keyframe_section(directory / f"{case_id}_现场记录.md", written)
+        skeleton = skeleton_in(directory)
+        if skeleton is not None:
+            rewrite_keyframe_section(skeleton, written)
     return written
 
 
@@ -382,6 +387,145 @@ def rewrite_keyframe_section(skeleton: Path, frames: list[Path]) -> None:
               "画面内容仍需你本人确认它是否足以证明「触发动作 / 现象」。", ""]
     skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+def skeleton_in(directory: Path) -> Path | None:
+    """在目录里找现场记录骨架；名字可能与用例编号不一致（如探索性目录）。"""
+    found = sorted(directory.glob("*_现场记录.md"))
+    return found[0] if found else None
+
+def frame_size_at(media: Path, at: float, ffmpeg: str, width: int = 160) -> float | None:
+    """取某一时刻的小帧体积（KB）——该时刻画面复杂度的代理指标。
+
+    为什么要单独取「间隙中点」的帧：2 fps 的采样间隔是 500 ms，
+    而最短的间隙可能只有 240 ms，最近的采样点常常落在间隙之外，
+    于是会被系统性判成「画面正常」。在间隙正中取帧才真正对得上。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "f.jpg"
+        subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-ss", f"{max(0.0, at):.3f}", "-i", str(media),
+             "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "4", str(target)],
+            capture_output=True,
+        )
+        return target.stat().st_size / 1024 if target.is_file() else None
+
+def screen_activity(media: Path, ffmpeg: str, fps: int = 2, width: int = 160) -> list[tuple[float, float]]:
+    """按帧取「画面复杂度」的时间序列（低分辨率帧的 JPEG 体积，单位 KB）。
+
+    用途：给段内间隙做**初步定性**——画面越简单（菜单、加载图、纯色），YSTD 越小；
+    正常游戏实机画面 YSTD 明显更大。于是「间隙瞬间画面很简单」更像设计行为
+    （菜单/加载/切窗口），「画面仍是实机内容」才更像真的丢声。
+
+    这只是初判，最终定性仍要人看一眼帧——工具给候选，人下结论。
+    """
+    # 最初想用 signalstats 的 YSTD，但本地 ffmpeg 构建的 metadata 输出只有 pts 行、
+    # 取不到统计值（实测）。改用「抽低分辨率帧 + 量 JPEG 体积」：画面越复杂，
+    # 同质量压缩后体积越大——一次 ffmpeg 调用抽完所有帧，再量文件大小，可靠且快。
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", str(media),
+             "-vf", f"fps={fps},scale={width}:-2", "-q:v", "4",
+             str(out / "f_%05d.jpg")],
+            capture_output=True,
+        )
+        frames = sorted(out.glob("f_*.jpg"))
+        return [(index / fps, frame.stat().st_size / 1024) for index, frame in enumerate(frames)]
+
+
+def classify_gap(time_s: float, activity: list[tuple[float, float]], ratio: float = 0.5,
+                 inside_size: float | None = None) -> tuple[str, float | None, float | None]:
+    """把一处间隙初步定性：画面简单 → 疑似 design；画面正常 → 疑似丢声。
+
+    阈值**不写死**：用该片段 YSTD 的中位数当基准，低于中位数一半即视为「画面简单」。
+    这样不同场景（白天/夜晚、室内/室外）都能自适应，不需要为每个场景调参。
+    返回 (初判, 间隙处画面体积, 片段中位体积)。
+    """
+    if not activity:
+        return ("无法判定（未取到画面数据）", None, None)
+    values = sorted(value for _, value in activity)
+    median = values[len(values) // 2]
+    if inside_size is None:
+        inside_size = min(activity, key=lambda item: abs(item[0] - time_s))[1]
+    verdict = ("疑似 design（画面很简单：菜单/加载/切窗口）" if inside_size < median * ratio
+               else "疑似丢声（间隙期间画面仍是正常实机内容）")
+    return (verdict, inside_size, median)
+
+
+def append_screen_section(skeleton: Path, rows: list[dict]) -> None:
+    """把画面初判写进骨架（独立小节，标明是自动初判、待人工确认）。"""
+    if not skeleton.is_file() or not rows:
+        return
+    text = skeleton.read_text(encoding="utf-8")
+    marker = "## 画面初判（自动，待人工确认）"
+    if marker in text:
+        text = text[: text.index(marker)].rstrip()
+    lines = [text, "", marker, "",
+             "| 片段 | 间隙时间 | 时长(ms) | 间隙处画面(KB) | 本片中位(KB) | 自动初判 | 对应帧 |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for row in rows:
+        ystd = "—" if row["ystd"] is None else f"{row['ystd']:.1f}"
+        median = "—" if row["median"] is None else f"{row['median']:.1f}"
+        lines.append(f"| `{row['take']}` | {row['time_s']:.3f}s | {row['duration_ms']:.0f} | {ystd} |"
+                     f" {median} | {row['verdict']} | `{row['frame']}` |")
+    lines += ["", "> 初判由「间隙瞬间的画面复杂度 vs 本片中位数」得出，**只是候选**："
+              "菜单、加载、剧情转场处的静音属设计行为，必须看一眼上表最后一列的帧再定性。", ""]
+    skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def analyze_screen(directory: Path, ffmpeg: str, case_id: str) -> list[dict]:
+    """对目录内每个片段的每处间隙做画面初判，并写进骨架。"""
+    measure_path = directory / "measure.json"
+    if not measure_path.is_file():
+        return []
+    report = json.loads(measure_path.read_text(encoding="utf-8"))
+    rows: list[dict] = []
+    for item in report["files"]:
+        stem = Path(item["path"]).stem
+        media = next((directory / f"{stem}{ext}" for ext in (".mkv", ".mp4", ".mov")
+                      if (directory / f"{stem}{ext}").is_file()), None)
+        if media is None:
+            continue
+        gaps = [gap for issue in item["issues"] if issue["check"] == "silence_gap"
+                for gap in issue["detail"].get("gaps", [])]
+        if not gaps:
+            continue
+        activity = screen_activity(media, ffmpeg)
+        for index, gap in enumerate(gaps, 1):
+            inside = frame_size_at(media, float(gap["time_s"]) + float(gap.get("duration_ms", 0)) / 2000.0,
+                                   ffmpeg)
+            verdict, ystd, median = classify_gap(float(gap["time_s"]), activity, inside_size=inside)
+            rows.append({
+                "take": stem, "time_s": float(gap["time_s"]),
+                "duration_ms": float(gap.get("duration_ms", 0)),
+                "verdict": verdict, "ystd": ystd, "median": median,
+                "frame": f"keyframe_{stem}_间隙{index:02d}_中.png",
+            })
+    append_screen_section(skeleton_in(directory), rows)
+    return rows
+
+def fill_marks(skeleton: Path | None, marks: dict[str, float]) -> list[str]:
+    """把录制时按下的打点时间码写进骨架的「关键时间码」行。
+
+    这是人工时间码的替代方案：边录边按键，比事后靠记忆回看录像准确得多，
+    而且不会漏记。没按的项保持空白，绝不猜。
+    """
+    if skeleton is None or not skeleton.is_file() or not marks:
+        return []
+    text = skeleton.read_text(encoding="utf-8")
+    joined = " · ".join(f"{name} {value:.3f}s" for name, value in marks.items())
+    lines = []
+    replaced = False
+    for line in text.splitlines():
+        if line.startswith("- 关键时间码："):
+            lines.append(f"- 关键时间码：{joined}")
+            replaced = True
+        else:
+            lines.append(line)
+    if not replaced:
+        return []
+    skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return list(marks)
 
 def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
                 dropout_min_ms: float, force: bool, quiet: bool = False,
@@ -443,6 +587,8 @@ def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
         append_keyframe_section(skeleton, frames, plan)
         result["keyframes"] = frames
         result["gap_count"] = len(gaps)
+        # 画面初判：把「间隙时画面是简单还是实机」先算出来，人只需确认
+        result["screen_rows"] = analyze_screen(directory, ffmpeg, case_id)
     else:
         result["gap_count"] = None
     return result
@@ -552,6 +698,10 @@ def run_auto(args: argparse.Namespace) -> int:
     ffmpeg = audio_qa.find_ffmpeg(None)
     takes_total = args.takes
     takes_done = 0
+    marks = [m.strip() for m in (args.marks or "").split(",") if m.strip()]
+    pressed: dict[str, float] = {}
+    macro_result: dict | None = None
+    record_started = 0.0
     recording = bool(client.call("GetRecordStatus").get("outputActive"))
     print(f"已连接 OBS（事件订阅已开）。用例：{args.case} · 目标 {takes_total} 段")
     print("按【回车】开始录制 → 在游戏里按拍摄脚本操作 → 再按【回车】停止；"
@@ -570,17 +720,42 @@ def run_auto(args: argparse.Namespace) -> int:
                             print("已发送停止录制…")
                         else:
                             client.call("StartRecord")
-                            print("已开始录制 —— 现在照拍摄脚本操作，完事按回车停止。")
+                            pressed = {}
+                            record_started = time.monotonic()
+                            print("已开始录制 —— 照拍摄脚本操作；关键动作可按 1..%d 打点：" % len(marks))
+                            for i, name in enumerate(marks, 1):
+                                print("     %d = %s" % (i, name))
+                            print("完事按回车停止。")
                     except Exception as exc:
                         # OBS 可能正处于 STARTING/STOPPING 之间，按键按早了不该让整个会话挂掉
                         print(f"  这一下没生效（{exc}），稍等一秒再按。")
                     time.sleep(0.5)
+                elif recording and key in "123456789":
+                    # 打点：人工时间码由按键生成，比事后靠记忆回看准确得多
+                    index = int(key) - 1
+                    if index < len(marks):
+                        name = marks[index]
+                        stamp = round(time.monotonic() - record_started, 3)
+                        pressed[name] = stamp
+                        print(f"  ◆ 打点 {key} = {name} @ {stamp:.3f}s")
+                    else:
+                        print(f"  这一段的打点只定义了 {len(marks)} 个，{key} 无效")
             event = client.poll_event(0.2)
             if event and event.get("eventType") == "RecordStateChanged":
                 action, path = interpret_record_event(event)
                 if action == "started":
                     recording = True
                     print("● 录制中…")
+                    if args.macro:
+                        import input_macro  # 同仓库脚本
+                        print(f"  执行模拟序列「{args.macro}」——三次用同一序列，刺激才一致…")
+                        macro_result = input_macro.run_scenario(args.macro, 0.0, False,
+                                                               args.macro_max_seconds)
+                        print("  序列结束，自动停止录制…")
+                        try:
+                            client.call("StopRecord")
+                        except Exception as exc:
+                            print(f"  自动停止失败：{exc}")
                 elif action == "stopped":
                     recording = False
                     print("■ 录制结束，正在处理…")
@@ -596,6 +771,15 @@ def run_auto(args: argparse.Namespace) -> int:
                     print_summary(result)
                     if result.get("env_filled"):
                         print(f"  环境表已自动填：{'、'.join(result['env_filled'])}")
+                    marks_from_macro = (macro_result or {}).get("marks", {})
+                    merged = {**marks_from_macro, **pressed}
+                    if marks_from_macro:
+                        print(f"  序列打点 {len(marks_from_macro)} 个已并入报告")
+                    written = fill_marks(result["skeleton"], merged)
+                    if written:
+                        print(f"  打点时间码已写入报告：{'、'.join(written)}")
+                    elif recording is False and marks:
+                        print("  提示：这一段没有打点（可按 1..%d 记录关键动作时间码）" % len(marks))
                     takes_done += 1
                     if takes_done < takes_total:
                         print(f"\n第 {takes_done}/{takes_total} 段完成。按回车录下一段。\n")
@@ -630,6 +814,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     auto_parser = sub.add_parser("auto", parents=[common],
                                  help="绑定录制与处理：按回车开始/停止，停录后自动处理（需 OBS 已开 WebSocket）")
     auto_parser.add_argument("--takes", type=int, default=3, help="本次要录几段（默认 3，对应 r01–r03）")
+    auto_parser.add_argument("--macro", help="录制开始后自动执行这个模拟输入序列（scripts\\input_macro.py list 可看列表）")
+    auto_parser.add_argument("--macro-max-seconds", type=float, default=120.0)
+    auto_parser.add_argument("--marks", default="combat_start,combat_music,combat_end,explore_resume",
+                              help="录制中按 1..N 打点，时间码自动写进报告；逗号分隔，默认对应 bug_03 的四个时间码")
+
+    sub.add_parser("analyze", parents=[common],
+                   help="对已有测量结果做画面初判（间隙时画面偏简单还是实机内容）并写入骨架")
 
     sub.add_parser("keyframes", parents=[common],
                    help="按当前 measure.json 重新截取关键帧并重写骨架的关键帧小节")
@@ -644,6 +835,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "auto":
         return run_auto(args)
+
+    if args.command == "analyze":
+        directory = target_dir(args.case, args.game)
+        if not directory.is_dir():
+            print(f"用例目录不存在：{directory}", file=sys.stderr)
+            return 2
+        if ffmpeg is None:
+            print("需要 ffmpeg 才能取画面数据", file=sys.stderr)
+            return 2
+        rows = analyze_screen(directory, ffmpeg, args.case)
+        print(f"已对 {len(rows)} 处间隙做画面初判：")
+        for row in rows:
+            print("  %-30s %7.3fs %4.0f ms → %s" % (row["take"], row["time_s"],
+                  row["duration_ms"], row["verdict"]))
+        print(f"已写入骨架：{skeleton_in(directory)}")
+        return 0
 
     if args.command == "keyframes":
         directory = target_dir(args.case, args.game)

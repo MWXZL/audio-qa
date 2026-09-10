@@ -44,7 +44,14 @@ SCENE_NAME = "原神 QA"
 VIDEO_SOURCE = "游戏画面"
 AUDIO_SOURCE = "游戏音频"
 RECORD_DIR = ROOT / "runtime" / "game-recordings"
-PROCESS_PATTERN = "yuanshen"
+# 目标游戏：进程名片段 + 窗口标题片段。configure 会自动认出正在运行的那个，
+# 也可用 --process 显式指定（进程名片段）。
+GAME_TARGETS = {
+    "genshin": ("yuanshen", "原神"),
+    "starrail": ("starrail", "星穹铁道"),
+    "zenless": ("zenlesszonezero", "绝区零"),
+}
+PROCESS_PATTERN = "yuanshen"   # 默认值，保持向后兼容；实际以 detect_target() 的结果为准
 
 VIDEO_SETTINGS = {
     "capture_mode": "any_fullscreen",   # 不需手选窗口；游戏一进全屏就被抓到
@@ -91,6 +98,26 @@ def pick_window_item(items: list[dict[str, Any]], pattern: str) -> str | None:
         if pattern.lower() in value.lower():
             return value
     return None
+
+
+def detect_target(preferred: str | None = None) -> tuple[str, str]:
+    """认出目标游戏：返回 (进程名片段, 窗口标题片段)。
+
+    先看显式指定的，其次按表里顺序找正在运行的窗口——这样换游戏录时
+    不需要改代码，也避免把星铁的会话接到原神的进程名上（那会抓不到声音）。
+    """
+    if preferred:
+        lowered = preferred.lower()
+        for key, (process, title) in GAME_TARGETS.items():
+            if lowered in (key, process.lower()):
+                return (process, title)
+        return (lowered, preferred)
+    for key in ("genshin", "starrail", "zenless"):
+        process, title = GAME_TARGETS[key]
+        if game_window_rect(title) is not None:
+            return (process, title)
+    process, title = GAME_TARGETS["genshin"]
+    return (process, title)
 
 
 def looks_fullscreen(rect: tuple[int, int, int, int], screen: tuple[int, int],
@@ -308,9 +335,12 @@ class ObsClient:
             pass
 
 
-def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
+def configure(client: ObsClient, audio_mode: str = "desktop", scene: str = SCENE_NAME,
+              process: str | None = None) -> list[str]:
     notes: list[str] = []
     RECORD_DIR.mkdir(parents=True, exist_ok=True)
+    process_pattern, title_pattern = detect_target(process)
+    notes.append(f"目标游戏：{title_pattern}（进程名片段 {process_pattern} · 场景 {scene}）")
 
     try:
         mode = client.call("GetProfileParameter", parameterCategory="Output",
@@ -328,11 +358,11 @@ def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
             notes.append(f"!! 输出参数 {category}/{name} 未设置：{exc}")
 
     scenes = [item["sceneName"] for item in client.call("GetSceneList").get("scenes", [])]
-    if SCENE_NAME not in scenes:
-        client.call("CreateScene", sceneName=SCENE_NAME)
-        notes.append(f"新建场景「{SCENE_NAME}」")
-    client.call("SetCurrentProgramScene", sceneName=SCENE_NAME)
-    notes.append(f"当前场景 → {SCENE_NAME}")
+    if scene not in scenes:
+        client.call("CreateScene", sceneName=scene)
+        notes.append(f"新建场景「{scene}」")
+    client.call("SetCurrentProgramScene", sceneName=scene)
+    notes.append(f"当前场景 → {scene}")
 
     inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
 
@@ -344,7 +374,7 @@ def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
 
     # 声音源：先建出来——窗口/进程列表只有在源存在之后才能查询
     if AUDIO_SOURCE not in inputs:
-        client.call("CreateInput", sceneName=SCENE_NAME, inputName=AUDIO_SOURCE,
+        client.call("CreateInput", sceneName=scene, inputName=AUDIO_SOURCE,
                     inputKind="wasapi_process_output_capture", inputSettings={},
                     sceneItemEnabled=False)
         inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
@@ -358,7 +388,7 @@ def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
         try:
             probe = client.call("GetInputPropertiesListPropertyItems",
                                 inputName=probe_name, propertyName="window")
-            window_value = pick_window_item(probe.get("propertyItems", []), PROCESS_PATTERN)
+            window_value = pick_window_item(probe.get("propertyItems", []), process_pattern)
             if window_value:
                 notes.append(f"从「{probe_name}」的窗口列表锁定目标进程：{window_value}")
                 break
@@ -380,7 +410,7 @@ def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
     # 画面源：按窗口是否铺满屏幕选种类，**建源时就把窗口值带上**，并且**回头验证**。
     # 实测教训：window 为空字符串时 OBS 会把窗口采集源丢掉——API 报成功但源并不存在，
     # 只信返回值就会得到「配好了」的假象，最后录出全黑。
-    rect = game_window_rect("原神")
+    rect = game_window_rect(title_pattern)
     fullscreen = rect is not None and looks_fullscreen(rect, screen_size())
     candidates = video_candidates(fullscreen)
     notes.append(f"游戏窗口 {rect} / 屏幕 {screen_size()} → 候选捕获方式 {candidates}")
@@ -402,7 +432,7 @@ def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
                 client.call("SetInputSettings", inputName=VIDEO_SOURCE,
                             inputSettings=settings, overlay=True)
             else:
-                client.call("CreateInput", sceneName=SCENE_NAME, inputName=VIDEO_SOURCE,
+                client.call("CreateInput", sceneName=scene, inputName=VIDEO_SOURCE,
                             inputKind=kind, inputSettings=settings, sceneItemEnabled=True)
             if kind == "monitor_capture":
                 # 源刚建好时属性列表还没就绪（只返回 DUMMY），必须等真实显示器出现再取值
@@ -450,9 +480,9 @@ def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
         if size > 20000:
             notes.append(f"画面源 {VIDEO_SOURCE} = {kind} · 源截图 {size // 1024} KB → 有画面 ✓")
             try:
-                item_id = client.call("GetSceneItemId", sceneName=SCENE_NAME,
+                item_id = client.call("GetSceneItemId", sceneName=scene,
                                       sourceName=VIDEO_SOURCE)["sceneItemId"]
-                client.call("SetSceneItemTransform", sceneName=SCENE_NAME, sceneItemId=item_id,
+                client.call("SetSceneItemTransform", sceneName=scene, sceneItemId=item_id,
                             sceneItemTransform={"positionX": 0, "positionY": 0,
                                                 "boundsType": "OBS_BOUNDS_SCALE_INNER",
                                                 "boundsAlignment": 0,
@@ -532,6 +562,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("action", choices=["check", "configure", "verify", "all"])
     parser.add_argument("--seconds", type=int, default=12, help="验证录制时长")
     parser.add_argument("--keep", action="store_true", help="保留验证录像")
+    parser.add_argument("--scene", default=SCENE_NAME,
+                        help="OBS 场景名（换游戏时用一个新名字，例如「星铁 QA」）")
+    parser.add_argument("--process", help="目标游戏：genshin / starrail / zenless，或进程名片段（默认自动识别）")
     parser.add_argument("--audio", choices=["desktop", "process"], default="desktop",
                         help="音频通路：desktop=系统混音（实测正常，默认）；"
                              "process=应用程序音频捕获（本机实测电平异常低）")
@@ -556,7 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.action in {"configure", "all"}:
             print("\n配置：")
-            for note in configure(client, args.audio):
+            for note in configure(client, args.audio, args.scene, args.process):
                 print(f"  {note}")
         if args.action in {"verify", "all"}:
             print("\n验证：")

@@ -144,6 +144,65 @@ class RecordEventTestCase(unittest.TestCase):
             {"eventData": {"outputState": "RECONNECTED"}})[0], "other")
 
 
+class ScreenTriageTestCase(unittest.TestCase):
+    """画面初判：把「间隙时画面是简单画面还是实机内容」自动算出来，供人确认。"""
+
+    ACTIVITY = [(0.0, 12.0), (0.5, 14.0), (1.0, 13.0), (1.5, 11.0), (2.0, 12.5)]
+
+    def test_simple_frame_is_treated_as_design_candidate(self) -> None:
+        activity = self.ACTIVITY + [(3.0, 1.5)]
+        verdict, ystd, median = session_runner.classify_gap(3.0, activity)
+        self.assertIn("design", verdict)
+        self.assertEqual(ystd, 1.5)
+        self.assertGreater(median, 10)
+
+    def test_normal_frame_is_treated_as_drop_candidate(self) -> None:
+        verdict, _ystd, _median = session_runner.classify_gap(1.0, self.ACTIVITY)
+        self.assertIn("疑似丢声", verdict)
+
+    def test_threshold_adapts_to_the_clip(self) -> None:
+        """阈值取本片中位数的一半——同一亮度在暗场景里不该被误判。"""
+        dark = [(0.0, 2.0), (1.0, 2.2), (2.0, 1.8)]
+        verdict, _y, _m = session_runner.classify_gap(1.0, dark)
+        self.assertIn("疑似丢声", verdict)
+
+    def test_missing_activity_does_not_fake_a_verdict(self) -> None:
+        verdict, ystd, median = session_runner.classify_gap(5.0, [])
+        self.assertIn("无法判定", verdict)
+        self.assertIsNone(ystd)
+        self.assertIsNone(median)
+
+
+class MarksTestCase(unittest.TestCase):
+    """打点：人工时间码由按键产生，没按的项必须留空（不能猜）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "bug_03_现场记录.md"
+        self.path.write_text("# 记录\n\n- 关键时间码：\n- 其它备注：\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_marks_are_written_with_three_decimals(self) -> None:
+        written = session_runner.fill_marks(self.path, {"combat_start": 12.3456, "combat_end": 30.5})
+        self.assertEqual(len(written), 2)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("combat_start 12.346s", text)
+        self.assertIn("combat_end 30.500s", text)
+
+    def test_untouched_lines_are_preserved(self) -> None:
+        session_runner.fill_marks(self.path, {"combat_start": 1.0})
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("- 其它备注：", text)
+        self.assertTrue(text.startswith("# 记录"))
+
+    def test_no_marks_leaves_file_untouched(self) -> None:
+        before = self.path.read_text(encoding="utf-8")
+        self.assertEqual(session_runner.fill_marks(self.path, {}), [])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+
 class EnvironmentFillTestCase(unittest.TestCase):
     SKELETON = "\n".join([
         "# 用例",
