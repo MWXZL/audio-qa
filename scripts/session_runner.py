@@ -163,6 +163,176 @@ def append_keyframe_section(skeleton: Path, frames: list[Path], plan: list[tuple
         handle.write("\n".join(lines))
 
 
+def obs_settings_live() -> dict[str, str]:
+    """从运行中的 OBS 读实时参数。
+
+    为什么不读配置文件：OBS 只在周期/退出时把内存状态写回 basic.ini，
+    刚用 API 改过的值在文件里还是旧的——读文件会填进过时信息，比不填更糟。
+    """
+    try:
+        import obs_setup  # 与 OBS 通信的客户端（同一仓库）
+        client = obs_setup.ObsClient()
+    except Exception:
+        return {}
+    try:
+        def param(category: str, name: str) -> str:
+            try:
+                return client.call("GetProfileParameter", parameterCategory=category,
+                                   parameterName=name).get("parameterValue", "") or ""
+            except Exception:
+                return ""
+
+        mode = param("Output", "Mode") or "Simple"
+        advanced = mode.lower().startswith("adv")
+        section = "AdvOut" if advanced else "SimpleOutput"
+        rec_format = param(section, "RecFormat" if advanced else "RecFormat2")
+        video = " / ".join(
+            part for part in (
+                f"{param('Video', 'BaseCX')}x{param('Video', 'BaseCY')}",
+                f"{param('Video', 'FPSCommon')} fps",
+                f"{param('Audio', 'SampleRate')} Hz {param('Audio', 'ChannelSetup')}",
+                rec_format,
+                f"轨道 {param(section, 'RecTracks')}" if param(section, "RecTracks") else "",
+            ) if part and not part.startswith("x")
+        )
+
+        # 输出设备：从**实际在用的音频源**上取 device_id 再换成可读名称。
+        # 读 profile 参数拿不到（该键不在 websocket 暴露的参数里），读源设置最直接。
+        device_name = ""
+        for source in ("桌面音频", "游戏音频", "麦克风/辅助音频"):
+            try:
+                settings = client.call("GetInputSettings", inputName=source).get("inputSettings", {})
+            except Exception:
+                continue
+            device_id = str(settings.get("device_id") or "").strip()
+            if not device_id:
+                continue
+            device_name = device_id
+            try:
+                items = client.call("GetInputPropertiesListPropertyItems", inputName=source,
+                                    propertyName="device_id").get("propertyItems", [])
+                for item in items:
+                    if str(item.get("itemValue")) == device_id:
+                        device_name = f"{item.get('itemName')}（{source}）"
+                        break
+            except Exception:
+                pass
+            break
+        return {"video": video, "device": device_name}
+    finally:
+        client.close()
+
+
+def obs_profile_settings() -> dict[str, str]:
+    """取 OBS 采集设置；优先实时查询，OBS 没开时才退回读配置文件。"""
+    live = obs_settings_live()
+    if live.get("video"):
+        live.setdefault("profile", "运行中的 OBS")
+        return live
+
+    import configparser
+    import os
+
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return {}
+    root = Path(appdata) / "obs-studio"
+    profile = "未命名"
+    user_ini = root / "user.ini"
+    if user_ini.is_file():
+        for line in user_ini.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Profile="):
+                profile = line.split("=", 1)[1].strip() or profile
+    ini = root / "basic" / "profiles" / profile / "basic.ini"
+    if not ini.is_file():
+        return {}
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read(ini, encoding="utf-8")
+    except Exception:
+        return {}
+
+    def get(section: str, key: str) -> str:
+        return (parser.get(section, key, fallback="") or "").strip()
+
+    devices = [
+        value.strip() for key, value in (parser.items("Audio") if parser.has_section("Audio") else [])
+        if "device" in key.lower() and value.strip()
+    ]
+    return {
+        "profile": profile,
+        "video": f"{get('Video', 'BaseCX')}x{get('Video', 'BaseCY')}"
+                 f" / {get('Video', 'FPSCommon')} fps"
+                 f" / {get('Audio', 'SampleRate')} Hz {get('Audio', 'ChannelSetup')}"
+                 f" / {get('SimpleOutput', 'RecFormat2') or get('AdvOut', 'RecFormat')}"
+                 f" / 轨道 {get('SimpleOutput', 'RecTracks') or get('AdvOut', 'RecTracks')}",
+        "device": "、".join(devices),
+    }
+
+
+def environment_prefill() -> dict[str, str]:
+    """能自动确定的「环境」字段（其余必须由执行者本人填）。
+
+    只填机器侧事实：系统版本、CPU/屏幕、OBS 采集设置与输出设备。
+    游戏版本、游戏内音频设置、网络状态属于现场信息，脚本无权代填。
+    """
+    import ctypes
+    import platform
+    import winreg
+
+    values: dict[str, str] = {}
+    try:
+        user32 = ctypes.windll.user32
+        screen = f"{user32.GetSystemMetrics(0)}x{user32.GetSystemMetrics(1)}"
+    except Exception:
+        screen = ""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            cpu = str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+    except Exception:
+        cpu = (platform.processor() or "未知 CPU").strip()
+    values["平台 / 型号"] = " · ".join(
+        part for part in (cpu, platform.platform(), f"屏幕 {screen}" if screen else "") if part
+    )
+    values["系统版本"] = f"{platform.system()} {platform.release()}（{platform.version()}）"
+
+    obs = obs_profile_settings()
+    if obs.get("video"):
+        values["采集设置（OBS 分辨率 / 帧率 / 采样率 / 轨道）"] = (
+            f"{obs['video']}（OBS 配置 {obs['profile']}）"
+        )
+    if obs.get("device"):
+        values["输出设备"] = obs["device"]
+    return values
+
+
+def fill_environment(skeleton: Path, values: dict[str, str]) -> list[str]:
+    """把自动确定的字段写进骨架的环境表。
+
+    只填**空的格子**：已经写了内容的行一律不覆盖——现场手填的信息比机器推测更可信。
+    返回实际填入的字段名列表。
+    """
+    text = skeleton.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    filled: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.startswith("|") or line.count("|") < 3:
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or cells[1]:
+            continue
+        for label, value in values.items():
+            if cells[0].startswith(label) and value:
+                lines[index] = f"| {cells[0]} | {value} |"
+                filled.append(cells[0])
+                break
+    if filled:
+        skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return filled
+
+
 def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
                 dropout_min_ms: float, force: bool, quiet: bool = False,
                 directory: Path | None = None) -> dict:
@@ -212,6 +382,7 @@ def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
     )
     skeleton = report["skeleton"]
     result["skeleton"] = skeleton
+    result["env_filled"] = fill_environment(skeleton, environment_prefill())
 
     if ffmpeg is not None:
         gaps = peek_dropouts(directory / "measure.json")

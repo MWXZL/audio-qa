@@ -99,6 +99,59 @@ class KeyframePlanTestCase(unittest.TestCase):
         self.assertLessEqual(plan[0][1], 0.4)
 
 
+class EnvironmentFillTestCase(unittest.TestCase):
+    SKELETON = "\n".join([
+        "# 用例",
+        "",
+        "## 一、环境（待填）",
+        "",
+        "| 项目 | 内容 |",
+        "| --- | --- |",
+        "| 游戏 / 版本 |  |",
+        "| 平台 / 型号 |  |",
+        "| 系统版本 |  |",
+        "| 输出设备 |  |",
+        "| 游戏音频设置 |  |",
+        "| 采集设置（OBS 分辨率 / 帧率 / 采样率 / 轨道） |  |",
+        "",
+    ])
+
+    def write(self, text: str) -> Path:
+        path = Path(self._tmp.name) / "bug_03_现场记录.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_only_machine_side_fields_are_filled(self) -> None:
+        """脚本只填机器侧事实；游戏版本、游戏内音频设置必须留给现场填。"""
+        values = {"平台 / 型号": "CPU X · 屏幕 2560x1440", "系统版本": "Windows 11", "输出设备": "耳机"}
+        filled = session_runner.fill_environment(self.write(self.SKELETON), values)
+        self.assertEqual(sorted(filled), ["平台 / 型号", "系统版本", "输出设备"])
+        text = (Path(self._tmp.name) / "bug_03_现场记录.md").read_text(encoding="utf-8")
+        self.assertIn("| 平台 / 型号 | CPU X · 屏幕 2560x1440 |", text)
+        self.assertIn("| 游戏 / 版本 |  |", text)
+        self.assertIn("| 游戏音频设置 |  |", text)
+
+    def test_existing_content_is_never_overwritten(self) -> None:
+        """现场手填的信息比机器推测更可信——已有内容一律不动。"""
+        text = self.SKELETON.replace("| 系统版本 |  |", "| 系统版本 | 手填的版本 |")
+        filled = session_runner.fill_environment(self.write(text), {"系统版本": "机器推测的版本"})
+        self.assertNotIn("系统版本", filled)
+        self.assertIn("| 系统版本 | 手填的版本 |", (Path(self._tmp.name) / "bug_03_现场记录.md").read_text(encoding="utf-8"))
+
+    def test_prefill_returns_only_known_labels(self) -> None:
+        values = session_runner.environment_prefill()
+        self.assertIn("平台 / 型号", values)
+        self.assertIn("系统版本", values)
+        self.assertNotIn("游戏 / 版本", values)
+        self.assertTrue(values["平台 / 型号"])
+
+
 class ProcessOneTestCase(unittest.TestCase):
     def test_archive_selfcheck_and_skeleton(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
