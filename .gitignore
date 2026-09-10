@@ -13,7 +13,12 @@ cube/
 # 大体量运行时产物：本地保留，不进版本库
 # 现场录制与临时输出（含 OBS 原始录像）
 runtime/
-captures/recordings/*.mkv
+# 录像一律不入库：体积大、且以后采集的片段会放在各用例目录下，
+# 只忽略 captures/recordings/ 是不够的，这里按扩展名全局忽略。
+*.mkv
+*.mp4
+*.mov
+*.flac
 
 
 # 与本次工具无关的外部工具输出
