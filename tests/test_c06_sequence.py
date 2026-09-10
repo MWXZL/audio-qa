@@ -186,6 +186,149 @@ class PnpCommandTestCase(unittest.TestCase):
         self.assertEqual(command[:3], ["powershell", "-NoProfile", "-NonInteractive"])
 
 
+class FakeCom:
+    """假的 COM 音频枚举器：只维护一份端点清单与默认设备。"""
+
+    def __init__(self, devices: list[dict]) -> None:
+        self.devices_list = [dict(item) for item in devices]
+        self.default = devices[0]["id"] if devices else ""
+
+    def devices(self) -> list[dict]:
+        return [{**item, "is_default": item["id"] == self.default}
+                for item in self.devices_list]
+
+    def default_device_id(self) -> str:
+        return self.default
+
+    def set_default(self, device_id: str) -> None:
+        self.default = device_id
+
+
+HANDSET = {"id": "id-hyperx", "name": "扬声器 (HyperX Virtual Surround Sound)", "is_default": True}
+BLUETOOTH = {"id": "id-enco", "name": "耳机 (OPPO Enco Air2（新声版）)", "is_default": False}
+REALTEK = {"id": "id-realtek", "name": "扬声器 (Realtek(R) Audio)", "is_default": False}
+
+
+class BluetoothObservationTestCase(unittest.TestCase):
+    """「蓝牙耳机是否自动重连」的判据必须能区分「一直连着」和「断过又回来」。"""
+
+    def setUp(self) -> None:
+        self.com = FakeCom([HANDSET, BLUETOOTH, REALTEK])
+
+    def ops(self) -> object:
+        return c06_sequence.DeviceOps(self.com, HANDSET, REALTEK, "inst-headset", "inst-bt",
+                                      clock=lambda: 0.0, log=lambda _m: None)
+
+    def drop_bt(self) -> None:
+        self.com.devices_list = [item for item in self.com.devices_list
+                                 if item["id"] != BLUETOOTH["id"]]
+
+    def restore_bt(self) -> None:
+        if all(item["id"] != BLUETOOTH["id"] for item in self.com.devices_list):
+            self.com.devices_list.append(dict(BLUETOOTH))
+
+    def test_bluetooth_endpoint_recognition(self) -> None:
+        self.assertTrue(c06_sequence.is_bluetooth_endpoint(BLUETOOTH["name"]))
+        self.assertTrue(c06_sequence.is_bluetooth_endpoint("Bluetooth Hands-Free"))
+        self.assertFalse(c06_sequence.is_bluetooth_endpoint(HANDSET["name"]))
+        self.assertFalse(c06_sequence.is_bluetooth_endpoint(REALTEK["name"]))
+
+    def test_reconnect_is_confirmed_only_after_it_really_disappeared(self) -> None:
+        ops = self.ops()
+        ops.observe()                      # 本段基准：蓝牙端点在册
+        self.drop_bt()
+        ops.observe()                      # 观察到它消失
+        self.restore_bt()
+        ok, effect = ops.do("observe_bt")
+        self.assertTrue(ok)
+        self.assertIn("消失过", effect)
+        self.assertIn("自动重连", effect)
+
+    def test_never_disconnected_is_not_reported_as_reconnected(self) -> None:
+        """耳机一直连着时端点清单看起来一模一样——不能据此写「已自动重连」。"""
+        ops = self.ops()
+        ops.observe()
+        ok, effect = ops.do("observe_bt")
+        self.assertFalse(ok)
+        self.assertIn("从未消失", effect)
+
+    def test_no_bluetooth_endpoint_is_reported_as_not_covered(self) -> None:
+        self.drop_bt()
+        ops = self.ops()
+        ops.observe()
+        ok, effect = ops.do("observe_bt")
+        self.assertTrue(ok)
+        self.assertIn("未覆盖", effect)
+
+    def test_endpoint_delta_describes_what_changed(self) -> None:
+        before = {"endpoints": ["A", "B", "C"]}
+        after = {"endpoints": ["A", "B"]}
+        text = c06_sequence.endpoint_delta(before, after)
+        self.assertIn("3 → 2", text)
+        self.assertIn("消失：C", text)
+        self.assertIn("清单没有变化", c06_sequence.endpoint_delta(after, after))
+
+    def test_failed_command_still_reports_the_observable_effect(self) -> None:
+        """命令报错不等于没效果：端点清单的变化是现场事实，必须写进证据。"""
+        def failing_apply(_action: str, _instance: str) -> tuple[bool, str]:
+            self.drop_bt()                              # 命令失败，但链路确实断了
+            return False, "Disable-PnpDevice : 常规故障"
+
+        saved = self._patch_pnp(failing_apply, (False, "pnputil: 失败"))
+        try:
+            ops = self.ops()
+            ok, effect = ops.do("bt_down")
+        finally:
+            self._restore_pnp(saved)
+        self.assertFalse(ok)
+        self.assertIn("常规故障", effect)
+        self.assertIn("3 → 2", effect)
+        self.assertIn("未受控", effect)
+
+    def _patch_pnp(self, apply_result, fallback_result=(False, ""), status="OK"):
+        """替换掉真实 PnP 调用：测试绝不能真去禁用设备，也不该等真实轮询超时。"""
+        def as_callable(value):
+            return value if callable(value) else (lambda _a, _i: value)
+
+        saved = (c06_sequence.pnp_apply, c06_sequence.pnp_apply_fallback,
+                 c06_sequence.pnp_status)
+        c06_sequence.pnp_apply = as_callable(apply_result)
+        c06_sequence.pnp_apply_fallback = as_callable(fallback_result)
+        c06_sequence.pnp_status = lambda _i: status
+        return saved
+
+    def _restore_pnp(self, saved) -> None:
+        (c06_sequence.pnp_apply, c06_sequence.pnp_apply_fallback,
+         c06_sequence.pnp_status) = saved
+
+    def test_enable_after_unsuccessful_disable_is_flagged(self) -> None:
+        """没成功禁用过，后面的「启用成功」不能当成重连证据。"""
+        saved = self._patch_pnp((True, "OK"))
+        try:
+            ops = self.ops()
+            ok, effect = ops.do("bt_up")
+        finally:
+            self._restore_pnp(saved)
+        self.assertTrue(ok)
+        self.assertIn("不构成", effect)
+
+    def test_pnputil_fallback_is_used_when_the_first_mechanism_fails(self) -> None:
+        saved = self._patch_pnp((False, "Disable-PnpDevice : 常规故障"), (True, "成功"),
+                                status="Error")
+        try:
+            ops = self.ops()
+            ops.observe()
+            ok, effect = ops.do("bt_down")
+        finally:
+            self._restore_pnp(saved)
+        self.assertTrue(ok)
+        self.assertIn("pnputil", effect)
+
+    def test_fallback_command_shape(self) -> None:
+        self.assertIn("/disable-device", c06_sequence.pnp_fallback_script("disable", "USB\\x"))
+        self.assertIn("/enable-device", c06_sequence.pnp_fallback_script("enable", "USB\\x"))
+
+
 class TimelineFileTestCase(unittest.TestCase):
     def payload(self) -> dict:
         plan = c06_sequence.build_plan(8.0, c06_sequence.DEFAULT_STEPS[:2], 1.0)

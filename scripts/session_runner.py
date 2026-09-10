@@ -93,21 +93,43 @@ def new_clip_name(case_id: str, index: int, suffix: str, when: datetime | None =
     return f"raw_{stamp}_{case_id}_r{index:02d}{suffix}"
 
 
-def peek_dropouts(measure_path: Path) -> list[dict]:
-    """从 field_session 产出的 measure.json 里取间隙（时间码 + 时长）。"""
+def report_items(measure_path: Path) -> list[dict]:
+    """读 measure.json 的片段列表（读不到就当空）。"""
     if not measure_path.is_file():
         return []
     try:
-        files = json.loads(measure_path.read_text(encoding="utf-8"))["files"]
+        return json.loads(measure_path.read_text(encoding="utf-8")).get("files", [])
     except Exception:
         return []
+
+
+def item_gaps(item: dict) -> list[dict]:
+    """取一个片段的段内间隙（时间码 + 时长）。"""
+    return [gap for issue in item.get("issues", []) if issue.get("check") == "silence_gap"
+            for gap in issue.get("detail", {}).get("gaps", [])]
+
+
+def peek_dropouts(measure_path: Path, stem: str | None = None) -> list[dict]:
+    """从 field_session 产出的 measure.json 里取间隙（时间码 + 时长）。
+
+    `stem` 用来只取**某一段**的间隙：把目录里所有片段的间隙混在一起排班，
+    关键帧的时间点就会张冠李戴（实测踩过：标签写「间隙01_前」而时间来自另一个片段）。
+    """
     found: list[dict] = []
-    for item in files:
-        for issue in item["issues"]:
-            if issue["check"] == "silence_gap":
-                found.extend(issue["detail"].get("gaps", []))
+    for item in report_items(measure_path):
+        if stem is not None and Path(item["path"]).stem != stem:
+            continue
+        found.extend(item_gaps(item))
     found.sort(key=lambda gap: gap["time_s"])
     return found
+
+
+def take_duration(measure_path: Path, stem: str) -> float:
+    """某一段的时长（秒）。找不到返回 0。"""
+    for item in report_items(measure_path):
+        if Path(item["path"]).stem == stem:
+            return float(item.get("duration_s") or 0.0)
+    return 0.0
 
 
 def keyframe_plan(gaps: list[dict], duration_s: float) -> list[tuple[str, float]]:
@@ -151,19 +173,43 @@ def extract_frames(media: Path, plan: list[tuple[str, float]], out_dir: Path,
     return written
 
 
-def append_keyframe_section(skeleton: Path, frames: list[Path], plan: list[tuple[str, float]]) -> None:
-    """把关键帧清单写回报告骨架，说明每张对应的录制时间点。"""
-    if not frames:
-        return
-    stamps = {label: at for label, at in plan}
-    lines = ["", "## 关键帧（自动截取，对应录制时间点）", ""]
-    for frame in frames:
-        label = frame.stem.replace("keyframe_", "")
-        lines.append(f"- `{frame.name}` —— {stamps.get(label, 0.0):.2f} s：{label}")
-    lines += ["", "> 截帧由 `scripts/session_runner.py` 按检测到的时间间隙自动完成；"
-              "画面内容仍需你本人确认它是否足以证明「触发动作 / 现象」。", ""]
-    with skeleton.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
+def keyframe_name(stem: str, label: str) -> str:
+    """关键帧文件名。**必须带片段号**：不带的话多段录制会互相覆盖，
+    而报告里「对应帧」一列是按片段名引用的，于是全部变成断链（实测踩过）。"""
+    return f"keyframe_{stem}_{label}.png"
+
+
+def rebuild_keyframe_section(skeleton: Path | None, directory: Path,
+                            measure_path: Path) -> list[Path]:
+    """按磁盘上实际存在的帧重建「关键帧」小节（幂等替换，不是追加）。
+
+    为什么从文件反推而不是记住每段的时间表：报告会被反复重生成，而帧是留在目录里的；
+    以目录为唯一事实来源，列表才不会与实际文件对不上。
+    """
+    if skeleton is None or not skeleton.is_file():
+        return []
+    found: list[Path] = []
+    rows: list[str] = []
+    for item in report_items(measure_path):
+        stem = Path(item["path"]).stem
+        plan = keyframe_plan(item_gaps(item), float(item.get("duration_s") or 0.0))
+        for label, at in plan:
+            target = directory / keyframe_name(stem, label)
+            if target.is_file():
+                found.append(target)
+                rows.append(f"- `{target.name}` —— {at:.2f} s：{stem} · {label}")
+    if not rows:
+        return []
+    text = skeleton.read_text(encoding="utf-8")
+    marker = "## 关键帧（自动截取，对应录制时间点）"
+    if marker in text:
+        # 从这一节开始整段重写：画面初判（在本节之后）由调用方随后重新追加
+        text = text[: text.index(marker)].rstrip() + "\n"
+    lines = [text.rstrip(), "", marker, "", *rows, "",
+             "> 截帧由 `scripts/session_runner.py` 按检测到的时间间隙自动完成；"
+             "画面内容仍需你本人确认它是否足以证明「触发动作 / 现象」。", ""]
+    skeleton.write_text("\n".join(lines), encoding="utf-8")
+    return found
 
 
 def obs_settings_live() -> dict[str, str]:
@@ -336,6 +382,16 @@ def fill_environment(skeleton: Path, values: dict[str, str]) -> list[str]:
     return filled
 
 
+def drop_legacy_frames(directory: Path) -> list[str]:
+    """删掉旧命名（不带片段名）的帧：那种名字在多段录制时会互相覆盖。"""
+    removed: list[str] = []
+    for stale in list(directory.glob("keyframe_*.png")):
+        if "_现场记录" not in stale.name and stale.name.count("_") < 3:
+            stale.unlink()
+            removed.append(stale.name)
+    return removed
+
+
 def refresh_keyframes(directory: Path, ffmpeg: str, case_id: str) -> list[Path]:
     """按 measure.json 里每段各自的间隙重新截帧，并重写骨架的关键帧小节。
 
@@ -346,46 +402,21 @@ def refresh_keyframes(directory: Path, ffmpeg: str, case_id: str) -> list[Path]:
     measure_path = directory / "measure.json"
     if not measure_path.is_file():
         return []
-    report = json.loads(measure_path.read_text(encoding="utf-8"))
-    for stale in list(directory.glob("keyframe_*.png")):
-        if "_现场记录" not in stale.name and stale.name.count("_") < 3:
-            stale.unlink()   # 清掉旧命名（不含片段名）的帧，避免一处间隙两张图
+    drop_legacy_frames(directory)
 
     written: list[Path] = []
-    for item in report["files"]:
+    for item in report_items(measure_path):
         stem = Path(item["path"]).stem
         media = next((directory / f"{stem}{ext}" for ext in (".mkv", ".mp4", ".mov", ".mka")
                       if (directory / f"{stem}{ext}").is_file()), None)
         if media is None:
             continue
-        gaps = [gap for issue in item["issues"] if issue["check"] == "silence_gap"
-                for gap in issue["detail"].get("gaps", [])]
-        plan = keyframe_plan(gaps, item["duration_s"])
+        plan = keyframe_plan(item_gaps(item), float(item.get("duration_s") or 0.0))
         written += extract_frames(media, plan, directory, ffmpeg, prefix=f"keyframe_{stem}_")
 
     if written:
-        skeleton = skeleton_in(directory)
-        if skeleton is not None:
-            rewrite_keyframe_section(skeleton, written)
+        rebuild_keyframe_section(skeleton_in(directory), directory, measure_path)
     return written
-
-
-def rewrite_keyframe_section(skeleton: Path, frames: list[Path]) -> None:
-    """重写骨架的关键帧小节（旧的删掉，写一份新的）。"""
-    if not skeleton.is_file():
-        return
-    text = skeleton.read_text(encoding="utf-8")
-    marker = "## 关键帧"
-    if marker in text:
-        head = text[: text.index(marker)].rstrip()
-        lines = [head, "", marker + "（自动截取，对应录制时间点）", ""]
-    else:
-        lines = [text.rstrip(), "", marker + "（自动截取，对应录制时间点）", ""]
-    for frame in frames:
-        lines.append(f"- `{frame.name}`")
-    lines += ["", "> 文件名里带片段名（`r01`/`r02`/`r03`）与间隙序号；"
-              "画面内容仍需你本人确认它是否足以证明「触发动作 / 现象」。", ""]
-    skeleton.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def skeleton_in(directory: Path) -> Path | None:
@@ -495,11 +526,16 @@ def analyze_screen(directory: Path, ffmpeg: str, case_id: str) -> list[dict]:
             inside = frame_size_at(media, float(gap["time_s"]) + float(gap.get("duration_ms", 0)) / 2000.0,
                                    ffmpeg)
             verdict, ystd, median = classify_gap(float(gap["time_s"]), activity, inside_size=inside)
+            frame = keyframe_name(stem, f"间隙{index:02d}_中")
+            # 每段只截前若干处间隙（上限见 MAX_KEYFRAMES），超出上限就别假装有帧——
+            # 报告里一个指向不存在文件的引用，比空着更糟（实测踩过：整列断链）。
+            if not (directory / frame).is_file():
+                frame = "（超出每段截帧上限，未截）"
             rows.append({
                 "take": stem, "time_s": float(gap["time_s"]),
                 "duration_ms": float(gap.get("duration_ms", 0)),
                 "verdict": verdict, "ystd": ystd, "median": median,
-                "frame": f"keyframe_{stem}_间隙{index:02d}_中.png",
+                "frame": frame,
             })
     append_screen_section(skeleton_in(directory), rows)
     return rows
@@ -583,12 +619,16 @@ def process_one(media: Path, case_id: str, game: str, ffmpeg: str | None,
     result["env_filled"] = fill_environment(skeleton, environment_prefill())
 
     if ffmpeg is not None:
-        gaps = peek_dropouts(directory / "measure.json")
-        durations = [item["duration_s"] for item in report["report"]["files"]]
-        duration = max(durations) if durations else 0.0
+        # 只取**这一段自己**的间隙与时长：混用整个目录的间隙会让关键帧标签与时间对不上，
+        # 帧名不带片段号还会让多段互相覆盖（实测踩过：报告里整整一列「对应帧」是断链）。
+        measure = directory / "measure.json"
+        drop_legacy_frames(directory)
+        gaps = peek_dropouts(measure, stem=archived.stem)
+        duration = take_duration(measure, archived.stem)
         plan = keyframe_plan(gaps, duration)
-        frames = extract_frames(archived, plan, directory, ffmpeg)
-        append_keyframe_section(skeleton, frames, plan)
+        frames = extract_frames(archived, plan, directory, ffmpeg,
+                                prefix=f"keyframe_{archived.stem}_")
+        rebuild_keyframe_section(skeleton, directory, measure)
         result["keyframes"] = frames
         result["gap_count"] = len(gaps)
         # 画面初判：把「间隙时画面是简单还是实机」先算出来，人只需确认

@@ -265,6 +265,75 @@ class FieldSessionTestCase(unittest.TestCase):
         again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
         self.assertIn("- 执行次数：3（另补测 1 段）", again)
 
+    def test_empty_tail_field_with_continuation_is_kept(self) -> None:
+        """「- 其它备注：」后面没有冒号后文字、只跟着说明行——那也是人写的，不能丢。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8").replace(
+            "- 其它备注：", "- 其它备注：\n  - 三段由同一脚本按绝对秒数执行\n  - 蓝牙一步未受控")
+        skeleton.write_text(text, encoding="utf-8")
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 三段由同一脚本按绝对秒数执行", again)
+        self.assertIn("- 蓝牙一步未受控", again)
+
+    def test_untouched_template_is_not_treated_as_filled(self) -> None:
+        """空白骨架不能被当成「已填」：否则标题里的「（待填）」会被错误摘掉。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        first = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("## 一、环境（待填）", again)
+        self.assertIn("## 四、结论（待填）", again)
+        self.assertEqual(first.count("## 四、结论（待填）"), again.count("## 四、结论（待填）"))
+
+    def test_multiline_conclusion_body_survives_regeneration(self) -> None:
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8").replace(
+            "- 实际（写可观察事实 + 时间码）：",
+            "- 实际（写可观察事实 + 时间码）：\n  1. 第一处 42.74s\n  2. 第二处 48.91s\n  3. 第三处 69.92s")
+        skeleton.write_text(text, encoding="utf-8")
+
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("1. 第一处 42.74s", again)
+        self.assertIn("2. 第二处 48.91s", again)
+        self.assertIn("3. 第三处 69.92s", again)
+
+    def test_filled_gap_table_cells_survive_regeneration(self) -> None:
+        """第三节两个人工列（画面内容 / 定性）必须按 (片段, 时间码) 认领回来。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.2) + silence(0.3) + sine(1.2))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8")
+        line = next(line for line in text.splitlines()
+                    if line.startswith("| `raw_20260910_bug_03_r01.wav` | 00:01.200"))
+        filled = line.replace("|  |  |", "| 实机画面，非加载图 | design（设备操作） |")
+        self.assertNotEqual(filled, line)
+        skeleton.write_text(text.replace(line, filled), encoding="utf-8")
+
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("实机画面，非加载图", again)
+        self.assertIn("design（设备操作）", again)
+
+    def test_gap_table_cells_do_not_leak_to_other_timecodes(self) -> None:
+        """按行身份认领：时间码不同的行不该拿到别人的定性。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.2) + silence(0.3) + sine(1.2))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8")
+        line = next(line for line in text.splitlines()
+                    if line.startswith("| `raw_20260910_bug_03_r01.wav` | 00:01.200"))
+        skeleton.write_text(text.replace(line, line.replace("|  |  |", "| 甲 | 乙 |")),
+                            encoding="utf-8")
+
+        write_wav(directory / "raw_20260910_bug_03_r02.wav", sine(2.0) + silence(0.4) + sine(2.0))
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        other = [line for line in again.splitlines()
+                 if line.startswith("| `raw_20260910_bug_03_r02.wav` |")][0]
+        self.assertNotIn("| 甲 |", other)
+
 
 if __name__ == "__main__":
     unittest.main()

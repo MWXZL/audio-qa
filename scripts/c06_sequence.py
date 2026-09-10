@@ -177,6 +177,52 @@ def pnp_status_script(instance_id: str) -> str:
     )
 
 
+def pnp_fallback_script(action: str, instance_id: str) -> str:
+    """第二条路：pnputil。
+
+    实测蓝牙无线电上 `Disable-PnpDevice` 会返回「常规故障」（带子设备的适配器常见），
+    而 pnputil 走的是另一套接口。两条都试、并把**哪条成功**记进证据里。
+    """
+    verb = "/disable-device" if action == "disable" else "/enable-device"
+    return f'pnputil {verb} "{instance_id}"'
+
+
+def first_line(text: str, limit: int = 80) -> str:
+    return (text.splitlines()[0].strip() if text else "")[:limit]
+
+
+# 蓝牙音频端点的识别标记：端点名由系统给出，中英文界面下写法不同
+BT_MARKERS = ("蓝牙", "Bluetooth", "Enco", "Buds", "AirPods", "WH-", "WF-", "Bose", "JBL")
+
+
+def is_bluetooth_endpoint(name: str) -> bool:
+    """判断一个渲染端点是不是蓝牙音频设备。纯函数。
+
+    为什么需要：判断「蓝牙耳机断连后是否自动重连」，必须**先确认它消失过**。
+    只看「现在在不在」会得出错误结论——耳机一直连着时，端点清单看起来一模一样。
+    """
+    return any(marker.lower() in name.lower() for marker in BT_MARKERS)
+
+
+def endpoint_delta(before: dict[str, Any], after: dict[str, Any]) -> str:
+    """用「渲染端点清单的变化」描述一次操作的实际效果。纯函数。
+
+    这是命令报错时唯一还能拿到的客观事实：命令失败了，但设备可能已经掉了。
+    没有它，报告里就只剩一句「命令失败」，而真正的现象（音频通路断了多久）反而丢了。
+    """
+    old, new = list(before.get("endpoints") or []), list(after.get("endpoints") or [])
+    gone = [name for name in old if name not in new]
+    back = [name for name in new if name not in old]
+    parts = []
+    if gone:
+        parts.append("消失：" + "、".join(gone))
+    if back:
+        parts.append("出现：" + "、".join(back))
+    if not parts:
+        parts.append("清单没有变化")
+    return f"渲染端点 {len(old)} → {len(new)}（" + "；".join(parts) + "）"
+
+
 def pnp_status(instance_id: str) -> str:
     code, text = run_ps(pnp_status_script(instance_id))
     if text:
@@ -187,9 +233,16 @@ def pnp_status(instance_id: str) -> str:
 def pnp_apply(action: str, instance_id: str) -> tuple[bool, str]:
     code, text = run_ps(pnp_action_script(action, instance_id))
     if code != 0:
-        first = text.splitlines()[0] if text else ""
-        return False, f"{action} 命令失败：{first[:160]}"
+        return False, first_line(text, 160)
     return True, text.splitlines()[-1].strip() if text else ""
+
+
+def pnp_apply_fallback(action: str, instance_id: str) -> tuple[bool, str]:
+    """pnputil 兜底。成功判据同时看退出码与输出里是否出现失败字样。"""
+    code, text = run_ps(pnp_fallback_script(action, instance_id))
+    lowered = text.lower()
+    ok = code == 0 and "failed" not in lowered and "失败" not in lowered and "错误" not in lowered
+    return ok, first_line(text, 160) if text else ""
 
 
 # ---------------------------------------------------------------- 目标解析
@@ -284,6 +337,8 @@ class DeviceOps:
         self.poll_interval = poll_interval
         self.log = log
         self.disabled: set[str] = set()      # 被我们禁用的 PnP 实例，结尾必须恢复
+        self.bt_names: list[str] | None = None   # 本段开始时在册的蓝牙音频端点
+        self.bt_absent_seen = False              # 本段里是否真的观察到它消失过
         try:
             self.original_default_id = com.default_device_id()
         except Exception:
@@ -298,10 +353,16 @@ class DeviceOps:
 
     def observe(self) -> dict[str, Any]:
         devices = self.com.devices()
+        names = [d["name"] for d in devices]
         default = next((d["name"] for d in devices if d["is_default"]), "")
+        if self.bt_names is None:
+            # 一段开始时的端点清单就是基准：之后「消失过又回来」才有意义
+            self.bt_names = [name for name in names if is_bluetooth_endpoint(name)]
+        elif any(name not in names for name in self.bt_names):
+            self.bt_absent_seen = True
         return {
             "default": default,
-            "endpoints": [d["name"] for d in devices],
+            "endpoints": names,
             "headset_present": any(d["name"] == self.headset["name"] for d in devices),
         }
 
@@ -341,10 +402,18 @@ class DeviceOps:
                                   "蓝牙无线电已恢复", expect_ok=True)
         if kind == "observe_bt":
             names = self.observe()["endpoints"]
-            present = any(key in name for name in names
-                          for key in ("Enco", "蓝牙", "Bluetooth", "Buds", "AirPods"))
-            return True, ("蓝牙耳机端点已回来（自动重连）" if present
-                          else "蓝牙耳机端点未回来（未自动重连）")
+            if not self.bt_names:
+                return True, ("本段开始时就**没有**蓝牙音频端点（耳机未连接）"
+                              "→ 本项未覆盖，不能写成「已重连」")
+            present = [name for name in self.bt_names if name in names]
+            if present and self.bt_absent_seen:
+                return True, (f"蓝牙音频端点在本段里消失过、现已回来（{present[0]}）"
+                              "→ 可记为自动重连")
+            if present:
+                # 没观察到消失就断言「重连」是假的：耳机一直连着也会得到同样的端点清单
+                return False, ("蓝牙音频端点在整段里**从未消失**（前置断连未生效）"
+                               "→ 不能记为「已重连」；本项需重录或改用受控断连")
+            return False, "蓝牙音频端点仍未回来（未自动重连）"
         return False, f"未知步骤类型：{kind}"
 
     def _switch(self, target: dict[str, Any], label: str) -> tuple[bool, str]:
@@ -362,9 +431,22 @@ class DeviceOps:
         if not instance_id:
             return False, (f"没找到「{what}」对应的 PnP 设备，这一步未执行"
                            "（报告里要写明本项未覆盖）")
+        was_disabled = instance_id in self.disabled
+        before = self.observe()
         ok, text = pnp_apply(action, instance_id)
+        mechanism = "Disable-PnpDevice" if action == "disable" else "Enable-PnpDevice"
         if not ok:
-            return False, text
+            # 第一条路失败就换 pnputil 再试：两条都失败时**不能只说「命令失败」**——
+            # 渲染端点清单的变化才是现场事实（实测：命令报常规故障，蓝牙链路却真的断了）。
+            ok2, text2 = pnp_apply_fallback(action, instance_id)
+            if ok2:
+                mechanism = "pnputil"
+            else:
+                after = self.observe()
+                return False, (
+                    f"两种机制都没成功——{mechanism}：{text or '（无输出）'}；"
+                    f"pnputil：{text2 or '（无输出）'}；{endpoint_delta(before, after)}。"
+                    "本步要按「未受控」记录：现象可能有，但刺激没被脚本控制住")
         if action == "disable":
             self.disabled.add(instance_id)
         else:
@@ -375,10 +457,14 @@ class DeviceOps:
 
         ok, waited = self._wait(reached)
         status = pnp_status(instance_id)
+        suffix = ""
+        if action == "enable" and not was_disabled:
+            suffix = "；注意此前并未成功禁用，故此步不构成「重连」的证据"
         if ok:
-            return True, f"{effect}：PnP 状态 {status}（{waited:.2f}s 生效）"
+            return True, f"{effect}：PnP 状态 {status}（{mechanism}，{waited:.2f}s 生效）{suffix}"
         expected = "OK" if expect_ok else "非 OK"
-        return False, f"未达到预期（期望 {expected}）：PnP 状态仍是 {status}（等待 {waited:.2f}s）"
+        return False, (f"未达到预期（期望 {expected}）：PnP 状态仍是 {status}"
+                       f"（{mechanism}，等待 {waited:.2f}s）{suffix}")
 
     # --- 安全网 ---
     def restore(self) -> list[str]:
@@ -414,17 +500,33 @@ def timeline_markdown(payload: dict[str, Any]) -> str:
         f"- 蓝牙无线电：{payload['bt_radio'] or '（未参与本次采集）'}",
         f"- 执行权限：{'管理员（提权会话）' if payload['elevated'] else '普通用户'}",
         "",
-        "| 步骤 | 计划(s) | 执行(s) | 生效(s) | 延迟(s) | 动作 | 生效判据 | 前：默认设备 | 后：默认设备 | 前：耳机端点 | 后：耳机端点 |",
+        "| 步骤 | 计划(s) | 执行(s) | 生效(s) | 延迟(s) | 结果 | 动作 | 生效判据 | 默认设备 前→后 | 端点数 前→后 | 耳机端点 前→后 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in payload["records"]:
         lines.append(
             f"| `{item['step']}` | {item['planned_at']:.2f} | {item['issued_at']:.3f} |"
-            f" {item['effective_at']:.3f} | {item['late_by']:.2f} | {item['label']} |"
-            f" {item['effect']} | {item['before']['default']} | {item['after']['default']} |"
-            f" {'在' if item['before']['headset_present'] else '不在'} |"
+            f" {item['effective_at']:.3f} | {item['late_by']:.2f} |"
+            f" {'生效' if item.get('ok') else '**未受控**'} | {item['label']} |"
+            f" {item['effect']} | {item['before']['default']} → {item['after']['default']} |"
+            f" {len(item['before'].get('endpoints') or [])} →"
+            f" {len(item['after'].get('endpoints') or [])} |"
+            f" {'在' if item['before']['headset_present'] else '不在'} →"
             f" {'在' if item['after']['headset_present'] else '不在'} |"
         )
+    failed = [item["step"] for item in payload["records"] if not item.get("ok")]
+    lines += ["", "## 这一次的判定摘要（脚本自动生成）", ""]
+    if failed:
+        lines.append(f"- {len(payload['records'])} 步中 {len(failed)} 步**未受控**："
+                     + "、".join(f"`{name}`" for name in failed) + "。"
+                     "「未受控」指脚本没能确认刺激生效，**不等于现象不存在**："
+                     "同一行的「端点数 前→后」列记的是实际发生了什么。")
+        if any(item["step"] == "bt_down" and not item.get("ok") for item in payload["records"]):
+            lines.append("- 蓝牙断连未受控时，**不得**用「耳机端点现在在不在」判定「自动重连」："
+                         "耳机一直连着时端点清单看起来完全一样，"
+                         "判据只能是「它消失过、又回来了」（见端点数列）。")
+    else:
+        lines.append(f"- {len(payload['records'])} 步全部生效。")
     lines += [
         "",
         "## 如实说明（这几条不能省，否则证据会被误读）",
@@ -457,14 +559,19 @@ def append_log_section(skeleton: Path | None, payload: dict[str, Any]) -> bool:
     if skeleton is None or not skeleton.is_file():
         return False
     rows = ["", "## 七、设备操作时间线（脚本自动生成，勿手改）", "",
-            "| 步骤 | 动作 | 生效时刻(s) | 生效判据 | 默认设备变化 |",
-            "| --- | --- | --- | --- | --- |"]
+            "| 步骤 | 结果 | 动作 | 生效时刻(s) | 生效判据 | 默认设备变化 | 端点数 前→后 |",
+            "| --- | --- | --- | --- | --- | --- | --- |"]
     for item in payload["records"]:
-        rows.append(f"| `{item['step']}` | {item['label']} | {item['effective_at']:.3f} |"
-                    f" {item['effect']} | {item['before']['default']} → {item['after']['default']} |")
+        rows.append(f"| `{item['step']}` | {'生效' if item.get('ok') else '**未受控**'} |"
+                    f" {item['label']} | {item['effective_at']:.3f} | {item['effect']} |"
+                    f" {item['before']['default']} → {item['after']['default']} |"
+                    f" {len(item['before'].get('endpoints') or [])} →"
+                    f" {len(item['after'].get('endpoints') or [])} |")
     rows += ["", "同目录 `设备序列_*.md` 是完整快照表（含每一步前后的端点清单）。",
              "「拔插耳机」实为端点设备的禁用/启用、「蓝牙断连」实为蓝牙无线电的禁用/启用，"
-             "均需管理员权限，**不是物理拔插**。", ""]
+             "均需管理员权限，**不是物理拔插**。",
+             "标 `未受控` 的步骤是**脚本没能确认刺激生效**，不等于现象不存在——"
+             "要看同一行的端点数变化。", ""]
     text = skeleton.read_text(encoding="utf-8")
     marker = "## 七、设备操作时间线"
     if marker in text:
@@ -749,6 +856,37 @@ def device_report() -> int:
     return 0
 
 
+def refresh_timelines(args: argparse.Namespace) -> int:
+    """按已存的 `设备序列_*.json` 重渲染时间线与报告第七节。
+
+    为什么需要：表结构、判据措辞改了之后，**已经录好的素材不该重录**——
+    json 里存的是原始记录（每一步的计划/执行/生效时刻与前后快照），
+    渲染层变了只要重画一遍即可。
+    """
+    import session_runner  # 同一仓库脚本
+
+    directory = session_runner.target_dir(args.case, args.game)
+    payloads = sorted(directory.glob("设备序列_*.json"))
+    if not payloads:
+        print(f"没有找到时间线：{directory}", file=sys.stderr)
+        return 2
+    latest: dict[str, Any] | None = None
+    for path in payloads:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"读不了 {path.name}：{exc}", file=sys.stderr)
+            continue
+        md_path = path.with_suffix(".md")
+        md_path.write_text(timeline_markdown(payload), encoding="utf-8")
+        latest = payload
+        print(f"已重渲染：{md_path.name}")
+    skeletons = sorted(directory.glob("*_现场记录.md"))
+    if latest and skeletons and append_log_section(skeletons[0], latest):
+        print(f"已重写报告第七节：{skeletons[0].name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="c06_sequence",
                                      description="C-06 设备切换一条龙取证（提权后自动执行）")
@@ -757,6 +895,10 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (("preview", "预演：列设备 + 打印时间表，不动系统"),
                             ("plan", "同 preview")):
         add_timetable_args(sub.add_parser(name, help=help_text))
+
+    refresh = sub.add_parser("refresh", help="按已存的时间线 JSON 重渲染表格与报告第七节")
+    refresh.add_argument("--case", default="c06_device_switch")
+    refresh.add_argument("--game", default=None)
 
     run = sub.add_parser("run", help="提权后按时间表执行，并自动归档测量")
     add_timetable_args(run)
@@ -807,13 +949,14 @@ def configure_stdio() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     configure_stdio()
     args = build_parser().parse_args(argv)
+    args.game = getattr(args, "game", None) or default_game()
     if args.command == "list":
         return device_report()
     if args.command in ("preview", "plan"):
-        args.game = args.game or default_game()
         return preview(args)
+    if args.command == "refresh":
+        return refresh_timelines(args)
 
-    args.game = args.game or default_game()
     admin = audio_devices.is_admin()
     if args.elevated and not admin:
         print("提权会话里仍然没有管理员权限——设备禁用/启用这一步做不了。", file=sys.stderr)

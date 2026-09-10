@@ -154,14 +154,85 @@ AUTO_RATE_LINE = re.compile(r"^- 复现率：__ / \d+$")
 # 把执行者写下的判断依据悄悄删掉了。
 RATE_LINE = re.compile(r"^- 复现率：(?P<head>[^/]*)/\s*(?P<den>\d+)(?P<tail>.*)$")
 RATE_PREFIX = "- 复现率："
+# 模板自带的「冒号后文字」：不算人工内容。不区分的话，「没填」会被误判成「填了」，
+# 于是空白骨架也会被当成已完成的报告（标题上的「（待填）」会被错误地摘掉）。
+TEMPLATE_TAILS = ("（PASS / FAIL / BLOCKED / 未复现）：", "（写可观察事实 + 时间码）：",
+                  "是 / 否", "")
+
+
+def human_row_key(cells: list[str]) -> tuple[str, str] | None:
+    """表格行的身份：(第一列, 第二列)。第三节的间隙表就是 (片段, 时间码)。"""
+    if len(cells) >= 3 and cells[0].startswith("`") and cells[1]:
+        return (cells[0], cells[1])
+    return None
+
+
+def collect_human_rows(old_text: str) -> dict[tuple[str, str], list[str]]:
+    """收集旧文件里人工填过的表格行尾巴（第三节的「画面内容 / 定性」两列）。
+
+    为什么按行身份而不是按行号搬：间隙表是测量结果，重跑测量会重排、增删行；
+    只有按 (片段, 时间码) 认领，人的定性才不会错位到别的间隙上。
+    """
+    kept: dict[tuple[str, str], list[str]] = {}
+    for line in old_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or stripped.count("|") < 4:
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        key = human_row_key(cells)
+        if key and any(cells[2:]):
+            kept[key] = cells[2:]
+    return kept
+
+
+def collect_human_lines(old_text: str) -> tuple[dict[str, str], str, str]:
+    """收集结论段里人工填写的行（含缩进续行）与复现率的分子/尾巴。
+
+    续行必须一起带走：实测踩过——「- 实际：」下面列了 5 条事实，重新生成后
+    只剩冒号，五条事实全没了（那正是结论的主体）。
+    """
+    lines = old_text.splitlines()
+    kept: dict[str, str] = {}
+    numerator = ""
+    tail_text = ""
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        for prefix in HUMAN_LINE_PREFIXES:
+            if not stripped.startswith(prefix):
+                continue
+            field_tail = stripped[len(prefix):].strip()
+            if prefix == "- 执行次数：" and AUTO_COUNT_LINE.match(stripped):
+                break             # 机器预填的形状：片段数变了就该跟着变
+            if prefix == RATE_PREFIX:
+                if not field_tail:
+                    break
+                match = RATE_LINE.match(stripped)
+                if match and not AUTO_RATE_LINE.match(stripped):
+                    numerator = match.group("head").strip()
+                    tail_text = match.group("tail")
+                elif not match:
+                    kept[f"line:{prefix}"] = stripped   # 人写成了别的形态，原样保留
+                break             # 分母由新片段数决定，稍后重组这一行
+            block = [stripped]
+            probe = index + 1
+            while probe < len(lines) and lines[probe][:1].isspace() and lines[probe].strip():
+                block.append(lines[probe].rstrip())
+                probe += 1
+            # 只有「人真的写了东西」才算填过：尾巴不等于模板文案，或者下面带了说明行
+            if field_tail not in TEMPLATE_TAILS or len(block) > 1:
+                kept[f"line:{prefix}"] = "\n".join(block)
+            break
+    return kept, numerator, tail_text
 
 
 def preserve_human_edits(new_text: str, previous_path: Path) -> str:
     """重新生成骨架时，保留已有文件里**人工填写**的内容。
 
     为什么必须做：骨架会因重新测量而被重写，而结论是人写的。
-    实测踩过：补测一段后重跑测量，手写的 PASS/预期/实际全被清空。
-    规则：环境表取非空格；结论段取冒号后有内容的行——只回填这两类。
+    实测踩过两次：① 补测一段后重跑测量，手写的 PASS/预期/实际全被清空；
+    ② 收下了首行却丢掉缩进续行，结论只剩一个冒号。
+    规则：环境表与非空的环境格、结论段冒号后有内容的行（含其缩进续行）、
+    以及间隙表里人工填过的列——只回填这几类。
     例外是「执行次数 / 复现率」：自动预填的部分（片段数）必须跟着目录走，
     人类真的改过形态时才保留（见 AUTO_COUNT_LINE / AUTO_RATE_LINE）。
     """
@@ -169,43 +240,47 @@ def preserve_human_edits(new_text: str, previous_path: Path) -> str:
         return new_text
     old = previous_path.read_text(encoding="utf-8")
     kept: dict[str, str] = {}
-    rate_numerator = ""
-    rate_tail = ""
     for line in old.splitlines():
         stripped = line.strip()
         if stripped.startswith("|") and stripped.count("|") >= 3:
-            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
             if len(cells) >= 2 and cells[1] and cells[0] not in {"项目", "---"}:
                 kept[f"env:{cells[0]}"] = cells[1]
-        for prefix in HUMAN_LINE_PREFIXES:
-            if stripped.startswith(prefix):
-                tail = stripped[len(prefix):].strip()
-                if tail:
-                    if prefix == "- 执行次数：" and AUTO_COUNT_LINE.match(stripped):
-                        continue      # 机器预填的形状：片段数变了就该跟着变
-                    if prefix == RATE_PREFIX:
-                        match = RATE_LINE.match(stripped)
-                        if match and not AUTO_RATE_LINE.match(stripped):
-                            rate_numerator = match.group("head").strip()
-                            rate_tail = match.group("tail")
-                        elif not match:
-                            kept[f"line:{prefix}"] = stripped   # 人写成了别的形态，原样保留
-                        continue      # 分母由新片段数决定，稍后重组这一行
-                    kept[f"line:{prefix}"] = stripped
-    if not kept and not rate_numerator:
+    line_kept, rate_numerator, rate_tail = collect_human_lines(old)
+    kept.update(line_kept)
+    rows = collect_human_rows(old)
+    if not kept and not rate_numerator and not rows:
         return new_text
 
     out: list[str] = []
-    for line in new_text.splitlines():
+    new_lines = new_text.splitlines()
+    index = 0
+    while index < len(new_lines):
+        line = new_lines[index]
         stripped = line.strip()
         replaced = False
+        consumed = 0
         if stripped.startswith("|") and stripped.count("|") >= 3:
-            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
             if len(cells) >= 2 and not cells[1]:
                 value = kept.get(f"env:{cells[0]}")
                 if value:
                     out.append(f"| {cells[0]} | {value} |")
                     replaced = True
+            if not replaced and len(cells) >= 4:
+                # 只把**空着的**格子按位置补上：机器算出来的列（时长、间隙位置）不能被人的旧值覆盖。
+                saved = rows.get(human_row_key(cells) or ("", ""))
+                if saved:
+                    merged = list(cells)
+                    changed = False
+                    for offset, value in enumerate(saved):
+                        position = 2 + offset
+                        if position < len(merged) and value and not merged[position]:
+                            merged[position] = value
+                            changed = True
+                    if changed:
+                        out.append("| " + " | ".join(merged) + " |")
+                        replaced = True
         if not replaced and stripped.startswith(RATE_PREFIX) and rate_numerator:
             total = stripped.rsplit("/", 1)[-1].strip() if "/" in stripped else ""
             out.append(f"{RATE_PREFIX}{rate_numerator} / {total}{rate_tail}")
@@ -217,9 +292,18 @@ def preserve_human_edits(new_text: str, previous_path: Path) -> str:
                     if value:
                         out.append(value)
                         replaced = True
+                        if "\n" in value:
+                            # 人的缩进续行已经一并带回来了，新文本里生成的续行必须跳过，
+                            # 否则同一段说明会出现两次。
+                            probe = index + 1
+                            while (probe < len(new_lines) and new_lines[probe][:1].isspace()
+                                   and new_lines[probe].strip()):
+                                probe += 1
+                            consumed = probe - index - 1
                     break
         if not replaced:
             out.append(line)
+        index += 1 + consumed
     # 填过的小节就不该再顶着「（待填）」——已经跑完的用例，报告标题还写着「待填」，
     # 自检会把它算成未完成项，报告上写的是同一句话。
     filled_env = any(key == "env:游戏 / 版本" for key in kept)
@@ -281,7 +365,7 @@ def render_skeleton(
             "工具只报 WARN：加载、传送、剧情转场处的静音是**设计行为**，"
             "只凭音频无法与「断流」区分，必须回到录像画面定性。",
             "",
-            "| 片段 | 时间码 | 时长(ms) | 画面内容（待填） | 定性（design / 候选缺陷） |",
+            "| 片段 | 时间码 | 时长(ms) | 画面内容（看帧后填） | 定性（design / 候选缺陷） |",
             "| --- | --- | --- | --- | --- |",
         ]
         for gap in gaps:
