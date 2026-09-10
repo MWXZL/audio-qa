@@ -1369,8 +1369,15 @@ def scan(
     do_loudness: bool,
     exts: Iterable[str],
     progress: bool = True,
+    paths: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
-    files = collect_files(root, exts)
+    """扫描目录。
+
+    `paths` 允许调用方给一份**已经筛过的文件清单**：现场记录会把「同一段录像 +
+    从它抽出来的无损音轨」先合并（见 `field_session.dedupe_takes`），否则同一段素材
+    会被算成两段，执行次数与复现率直接翻倍。
+    """
+    files = sorted(paths) if paths is not None else collect_files(root, exts)
     if not files:
         raise AudioQAError(f"{root} 下没有找到可检查的音频文件")
     started = time.time()

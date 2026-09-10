@@ -705,6 +705,8 @@ def run_auto(args: argparse.Namespace) -> int:
     marks = [m.strip() for m in (args.marks or "").split(",") if m.strip()]
     pressed: dict[str, float] = {}
     macro_result: dict | None = None
+    device_marks: dict[str, float] = {}
+    device_cycle_done = False
     record_started = 0.0
     recording = bool(client.call("GetRecordStatus").get("outputActive"))
     print(f"已连接 OBS（事件订阅已开）。用例：{args.case} · 目标 {takes_total} 段")
@@ -726,6 +728,7 @@ def run_auto(args: argparse.Namespace) -> int:
                             client.call("StartRecord")
                             pressed = {}
                             record_started = time.monotonic()
+                            device_cycle_done = False
                             print("已开始录制 —— 照拍摄脚本操作；关键动作可按 1..%d 打点：" % len(marks))
                             for i, name in enumerate(marks, 1):
                                 print("     %d = %s" % (i, name))
@@ -744,11 +747,33 @@ def run_auto(args: argparse.Namespace) -> int:
                         print(f"  ◆ 打点 {key} = {name} @ {stamp:.3f}s")
                     else:
                         print(f"  这一段的打点只定义了 {len(marks)} 个，{key} 无效")
+            # 设备切换（C-06）：录制到指定秒数时自动切一次再切回。
+            # 在录制过程中执行，时间码天然与录像对齐（记的是录像内相对秒数）。
+            if (args.device_cycle and recording and not device_cycle_done and record_started
+                    and time.monotonic() - record_started >= args.cycle_at):
+                device_cycle_done = True
+                try:
+                    import audio_devices
+                    offset = round(time.monotonic() - record_started, 3)
+                    print(f"  ◆ 执行设备切换（录像内 {offset:.1f}s 处）：{args.device_cycle}")
+                    result_cycle = audio_devices.run_cycle(
+                        args.device_cycle, args.cycle_hold, None, keep_changed=False)
+                    for name, at in (result_cycle.get("marks") or {}).items():
+                        device_marks[name] = round(offset + float(at), 3)
+                    print(f"  设备切换完成，时间码：{device_marks}")
+                except Exception as exc:
+                    print(f"  设备切换失败（不影响继续录制）：{exc}")
+
             event = client.poll_event(0.2)
             if event and event.get("eventType") == "RecordStateChanged":
                 action, path = interpret_record_event(event)
                 if action == "started":
                     recording = True
+                    if not record_started:
+                        # 外部（OBS 按钮/热键）开始录制时也要记起点，否则依赖
+                        # 「录像内相对秒数」的功能（设备切换、打点）会全部失效——实测踩过。
+                        record_started = time.monotonic()
+                        device_cycle_done = False
                     print("● 录制中…")
                     if args.macro:
                         import input_macro  # 同仓库脚本
@@ -775,7 +800,7 @@ def run_auto(args: argparse.Namespace) -> int:
                     print_summary(result)
                     if result.get("env_filled"):
                         print(f"  环境表已自动填：{'、'.join(result['env_filled'])}")
-                    marks_from_macro = (macro_result or {}).get("marks", {})
+                    marks_from_macro = {**(macro_result or {}).get("marks", {}), **device_marks}
                     merged = {**marks_from_macro, **pressed}
                     if marks_from_macro:
                         print(f"  序列打点 {len(marks_from_macro)} 个已并入报告")
@@ -819,6 +844,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                  help="绑定录制与处理：按回车开始/停止，停录后自动处理（需 OBS 已开 WebSocket）")
     auto_parser.add_argument("--takes", type=int, default=3, help="本次要录几段（默认 3，对应 r01–r03）")
     auto_parser.add_argument("--macro", help="录制开始后自动执行这个模拟输入序列（scripts\\input_macro.py list 可看列表）")
+    auto_parser.add_argument("--device-cycle", help="录制中自动切一次输出设备再切回（设备名片段，例如 G72）；用于 C-06")
+    auto_parser.add_argument("--cycle-at", type=float, default=15.0, help="录制开始后多少秒执行设备切换")
+    auto_parser.add_argument("--cycle-hold", type=float, default=6.0, help="停留在新设备上的秒数")
     auto_parser.add_argument("--macro-max-seconds", type=float, default=120.0)
     auto_parser.add_argument("--marks", default="combat_start,combat_music,combat_end,explore_resume",
                               help="录制中按 1..N 打点，时间码自动写进报告；逗号分隔，默认对应 bug_03 的四个时间码")

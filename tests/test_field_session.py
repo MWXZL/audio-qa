@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -154,26 +155,115 @@ class FieldSessionTestCase(unittest.TestCase):
         self.assertTrue((directory / "measure.md").is_file())
         self.assertEqual(result["skeleton"].name, "bug_01_现场记录.md")
 
+    # ---------------------------------------------------- 同一段的录像与音轨不能算两段
+    def test_dedupe_prefers_the_video_file(self) -> None:
+        """归档目录里同时有 .mkv 与抽出来的 .mka——那是一段素材，不是两段。"""
+        paths = [Path("/x/raw_20260910_bug_03_r01.mka"),
+                 Path("/x/raw_20260910_bug_03_r01.mkv")]
+        kept = field_session.dedupe_takes(paths)
+        self.assertEqual([path.name for path in kept], ["raw_20260910_bug_03_r01.mkv"])
 
+    def test_dedupe_keeps_distinct_takes(self) -> None:
+        paths = [Path(f"/x/raw_20260910_bug_03_r{index:02d}.mkv") for index in (1, 2, 3)]
+        self.assertEqual(len(field_session.dedupe_takes(paths)), 3)
+
+    def test_dedupe_keeps_audio_only_takes(self) -> None:
+        """纯音频方案下只有 .mka，不能因为「没有视频」就把素材丢掉。"""
+        paths = [Path(f"/x/raw_20260910_bug_03_r{index:02d}.mka") for index in (1, 2)]
+        self.assertEqual(len(field_session.dedupe_takes(paths)), 2)
+
+    def test_dedupe_of_empty_list(self) -> None:
+        self.assertEqual(field_session.dedupe_takes([]), [])
+
+    def test_report_counts_one_take_when_video_and_audio_copy_coexist(self) -> None:
+        """端到端：录像 + 无损音轨同目录时，执行次数必须还是 1（曾经被算成 2）。"""
+        ffmpeg = __import__("audio_qa").find_ffmpeg(None)
+        if ffmpeg is None:
+            self.skipTest("没有 ffmpeg，无法生成真实录像")
         directory = self.root / "bug_03_music"
-        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.2) + silence(0.3) + sine(1.2))
-        skeleton = self.session(directory)["skeleton"]
-        text = skeleton.read_text(encoding="utf-8")
-
-        # 未填结论时解析出的值为空——构建脚本据此跳过该条，不把「骨架存在」当「已执行」
-        verdict_line = next(line for line in text.splitlines() if line.startswith("- 结论（"))
-        parsed_empty = builder.VERDICT_LINE.match(verdict_line.strip())
-        self.assertIsNotNone(parsed_empty)
-        self.assertEqual(parsed_empty.group(1).strip(), "")
-
-        # 填入结论后必须能解析出原值
-        filled = text.replace(verdict_line, verdict_line + "PASS")
-        skeleton.write_text(filled, encoding="utf-8")
-        parsed = builder.VERDICT_LINE.match(
-            next(line for line in filled.splitlines() if line.startswith("- 结论（")).strip()
+        directory.mkdir(parents=True, exist_ok=True)
+        mkv = directory / "raw_20260910_bug_03_r01.mkv"
+        made = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1.2",
+             "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1.2",
+             "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(mkv)],
+            capture_output=True,
         )
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed.group(1).strip(), "PASS")
+        if made.returncode != 0 or not mkv.is_file():
+            self.skipTest(f"本机 ffmpeg 生成测试录像失败：{made.stderr[:80]!r}")
+        mka = directory / "raw_20260910_bug_03_r01.mka"
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(mkv), "-vn",
+                        "-c:a", "copy", str(mka)], capture_output=True)
+        self.assertTrue(mka.is_file())
+        result = field_session.run_session(directory=directory, case="bug_03",
+                                           exts=["mkv", "mka"], dropout_min_ms=80.0,
+                                           do_loudness=False, quiet=True)
+        text = result["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 执行次数：1（本目录内 1 个片段）", text)
+        self.assertIn("- 复现率：__ / 1", text)
+        self.assertTrue(all(not item["path"].endswith(".mka")
+                            for item in result["report"]["files"]))
+
+    # ---------------------------------------------------- 片段数变了，计数必须跟着变
+    def test_take_count_follows_directory_when_a_take_is_added(self) -> None:
+        """补录一段后重新测量，「执行次数」必须变成新的片段数（曾经一直停在旧值）。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        first = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 执行次数：1（本目录内 1 个片段）", first)
+
+        write_wav(directory / "raw_20260910_bug_03_r02.wav", sine(1.0))
+        second = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 执行次数：2（本目录内 2 个片段）", second)
+        self.assertIn("- 复现率：__ / 2", second)
+
+    def test_rate_numerator_survives_but_denominator_follows_takes(self) -> None:
+        """人工填的复现率分子要保住，分母必须跟着片段数变。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8").replace("- 复现率：__ / 1", "- 复现率：0 / 1")
+        skeleton.write_text(text, encoding="utf-8")
+
+        write_wav(directory / "raw_20260910_bug_03_r02.wav", sine(1.0))
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 复现率：0 / 2", again)
+
+    def test_rate_comment_after_denominator_is_kept(self) -> None:
+        """复现率行尾的说明是执行者写下的判断依据，重生成时不能悄悄删掉。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8").replace(
+            "- 复现率：__ / 1", "- 复现率：0 / 1（三次均未出现异常）")
+        skeleton.write_text(text, encoding="utf-8")
+
+        write_wav(directory / "raw_20260910_bug_03_r02.wav", sine(1.0))
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 复现率：0 / 2（三次均未出现异常）", again)
+
+    def test_rate_line_written_in_free_form_is_preserved(self) -> None:
+        """人把复现率写成了别的形态（没有分母）时，整行原样保留。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8").replace(
+            "- 复现率：__ / 1", "- 复现率：本目录为探索性观察，不计复现率")
+        skeleton.write_text(text, encoding="utf-8")
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 复现率：本目录为探索性观察，不计复现率", again)
+
+    def test_customised_count_line_is_not_clobbered(self) -> None:
+        """人真的把计数行改成别的形态时（写了备注），不能被自动预填覆盖。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8").replace(
+            "- 执行次数：1（本目录内 1 个片段）", "- 执行次数：3（另补测 1 段）")
+        skeleton.write_text(text, encoding="utf-8")
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 执行次数：3（另补测 1 段）", again)
 
 
 if __name__ == "__main__":

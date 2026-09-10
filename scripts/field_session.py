@@ -31,6 +31,26 @@ NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CASE_PATTERN = re.compile(r"(bug_\d+|RC-\d+|C-\d+|compat_[a-z]+_c\d+)", re.IGNORECASE)
+VIDEO_EXTS = (".mkv", ".mp4", ".mov", ".avi", ".webm")
+
+
+def dedupe_takes(paths: Sequence[Path]) -> list[Path]:
+    """同一段落里「录像 + 从它抽出的无损音轨」是**一段素材，不是两段**。
+
+    采集流水线会在归档目录里同时留下 `xxx.mkv` 与 `xxx.mka`（音轨是无损拷贝，
+    便于提交和听辨）。若不合并，报告会把 1 段算成 2 段——「执行次数」「复现率」
+    正好是证据里最不能错的两个数字（实测踩过：1 段录制成报告里写 2 段）。
+    同一 stem 只留一个，优先留带视频轨的那个。纯函数。
+    """
+    grouped: dict[str, list[Path]] = {}
+    for path in paths:
+        grouped.setdefault(path.stem, []).append(path)
+    kept: list[Path] = []
+    for stem in sorted(grouped):
+        group = sorted(grouped[stem],
+                       key=lambda item: (item.suffix.lower() not in VIDEO_EXTS, str(item)))
+        kept.append(group[0])
+    return sorted(kept)
 
 
 def infer_case(directory: Path, explicit: str | None) -> str:
@@ -124,6 +144,16 @@ def host_environment() -> dict[str, str]:
 
 HUMAN_LINE_PREFIXES = ("- 结论", "- 执行次数：", "- 复现率：", "- 各段是否", "- 预期：",
                        "- 实际", "- 关键时间码：", "- 是否升级为缺陷", "- 其它备注：")
+# 「执行次数」与「复现率」的分母是从目录里的片段数算出来的，而目录会随着补录而变长。
+# 它们如果当成普通人工行保留下来，补录第 2、3 段之后报告里会一直写着 1 段（实测踩过），
+# 而这两个数字正是证据里最不能错的地方——所以只保留「人改过的形态」。
+AUTO_COUNT_LINE = re.compile(r"^- 执行次数：\d+（本目录内 \d+ 个片段）$")
+AUTO_RATE_LINE = re.compile(r"^- 复现率：__ / \d+$")
+# 复现率一行拆成「分子 / 分母 + 尾巴」：分母是机器按片段数算的，分子和尾巴是人写的。
+# 尾巴必须一起保留——实测踩过：「0 / 3（三次均未出现异常）」重生成后变成了「0 / 3」，
+# 把执行者写下的判断依据悄悄删掉了。
+RATE_LINE = re.compile(r"^- 复现率：(?P<head>[^/]*)/\s*(?P<den>\d+)(?P<tail>.*)$")
+RATE_PREFIX = "- 复现率："
 
 
 def preserve_human_edits(new_text: str, previous_path: Path) -> str:
@@ -132,11 +162,15 @@ def preserve_human_edits(new_text: str, previous_path: Path) -> str:
     为什么必须做：骨架会因重新测量而被重写，而结论是人写的。
     实测踩过：补测一段后重跑测量，手写的 PASS/预期/实际全被清空。
     规则：环境表取非空格；结论段取冒号后有内容的行——只回填这两类。
+    例外是「执行次数 / 复现率」：自动预填的部分（片段数）必须跟着目录走，
+    人类真的改过形态时才保留（见 AUTO_COUNT_LINE / AUTO_RATE_LINE）。
     """
     if not previous_path.is_file():
         return new_text
     old = previous_path.read_text(encoding="utf-8")
     kept: dict[str, str] = {}
+    rate_numerator = ""
+    rate_tail = ""
     for line in old.splitlines():
         stripped = line.strip()
         if stripped.startswith("|") and stripped.count("|") >= 3:
@@ -147,8 +181,18 @@ def preserve_human_edits(new_text: str, previous_path: Path) -> str:
             if stripped.startswith(prefix):
                 tail = stripped[len(prefix):].strip()
                 if tail:
+                    if prefix == "- 执行次数：" and AUTO_COUNT_LINE.match(stripped):
+                        continue      # 机器预填的形状：片段数变了就该跟着变
+                    if prefix == RATE_PREFIX:
+                        match = RATE_LINE.match(stripped)
+                        if match and not AUTO_RATE_LINE.match(stripped):
+                            rate_numerator = match.group("head").strip()
+                            rate_tail = match.group("tail")
+                        elif not match:
+                            kept[f"line:{prefix}"] = stripped   # 人写成了别的形态，原样保留
+                        continue      # 分母由新片段数决定，稍后重组这一行
                     kept[f"line:{prefix}"] = stripped
-    if not kept:
+    if not kept and not rate_numerator:
         return new_text
 
     out: list[str] = []
@@ -162,6 +206,10 @@ def preserve_human_edits(new_text: str, previous_path: Path) -> str:
                 if value:
                     out.append(f"| {cells[0]} | {value} |")
                     replaced = True
+        if not replaced and stripped.startswith(RATE_PREFIX) and rate_numerator:
+            total = stripped.rsplit("/", 1)[-1].strip() if "/" in stripped else ""
+            out.append(f"{RATE_PREFIX}{rate_numerator} / {total}{rate_tail}")
+            replaced = True
         if not replaced:
             for prefix in HUMAN_LINE_PREFIXES:
                 if stripped.startswith(prefix):
@@ -172,6 +220,14 @@ def preserve_human_edits(new_text: str, previous_path: Path) -> str:
                     break
         if not replaced:
             out.append(line)
+    # 填过的小节就不该再顶着「（待填）」——已经跑完的用例，报告标题还写着「待填」，
+    # 自检会把它算成未完成项，报告上写的是同一句话。
+    filled_env = any(key == "env:游戏 / 版本" for key in kept)
+    filled_verdict = any(key.startswith("line:- 结论") for key in kept)
+    if filled_env:
+        out = [line.replace("## 一、环境（待填）", "## 一、环境") for line in out]
+    if filled_verdict:
+        out = [line.replace("## 四、结论（待填）", "## 四、结论") for line in out]
     return "\n".join(out) + "\n"
 
 def render_skeleton(
@@ -300,6 +356,8 @@ def run_session(
         raise audio_qa.AudioQAError(f"目录不存在：{directory}")
     ffmpeg = audio_qa.find_ffmpeg(None)
     cfg = audio_qa.Thresholds(dropout_min_ms=dropout_min_ms)
+    # 先合并「同一段的录像与无损音轨」，再送去测量：否则执行次数 / 复现率会翻倍。
+    deduped = dedupe_takes(audio_qa.collect_files(directory.resolve(), exts))
     report = audio_qa.scan(
         root=directory.resolve(),
         cfg=cfg,
@@ -308,6 +366,7 @@ def run_session(
         do_loudness=do_loudness and ffmpeg is not None,
         exts=exts,
         progress=not quiet,
+        paths=deduped or None,
     )
     resolved_case = infer_case(directory, case)
     (directory / "measure.json").write_text(
