@@ -448,6 +448,118 @@ def print_summary(result: dict) -> None:
         print(f"  报告骨架：{result['skeleton'].name}（只需填「一、环境」与「四、结论」）")
 
 
+def interpret_record_event(event: dict) -> tuple[str, str]:
+    """把 OBS 的 RecordStateChanged 事件翻译成 (动作, 文件路径)。
+
+    注意：OBS 实际发的状态串**带前缀**——`OBS_WEBSOCKET_OUTPUT_STARTED` /
+    `..._STOPPING` / `..._STOPPED`。按裸 `STOPPED` 精确匹配会全部落空
+    （实测踩过：STARTED 因为有 outputActive 兜底还能认出，STOPPED 直接丢）。
+
+    动作取 "starting" / "started" / "stopping" / "stopped" / "other"；
+    只有 "stopped" 是可据以处理文件的终态。
+    """
+    data = event.get("eventData", {}) if event else {}
+    state = str(data.get("outputState", "")).upper().replace("OBS_WEBSOCKET_OUTPUT_", "")
+    path = str(data.get("outputPath") or "")
+    if state == "STARTED" or (data.get("outputActive") is True and state not in {"STOPPING", "STOPPED"}):
+        return ("started", path)
+    if state == "STOPPED":
+        return ("stopped", path)
+    if state == "STOPPING":
+        return ("stopping", path)
+    if state == "STARTING":
+        return ("starting", path)
+    return ("other", path)
+
+
+def run_auto(args: argparse.Namespace) -> int:
+    """把「监听」和「录制」绑在一条命令里：按回车开始/停止，停录后自动处理。
+
+    也认你在 OBS 里手点的开始/停止——走的是 OBS 的录制状态事件，
+    所以三种触发方式（回车、OBS 按钮、OBS 热键）都会被接管。
+    """
+    try:
+        import msvcrt  # Windows 控制台按键
+    except Exception:
+        msvcrt = None  # 非交互环境（如被重定向）下退化为「只认 OBS 事件」
+
+    def key_pressed() -> bool:
+        if msvcrt is None:
+            return False
+        try:
+            return bool(msvcrt.kbhit())
+        except Exception:
+            return False
+
+    try:
+        import obs_setup
+        client = obs_setup.ObsClient(events=obs_setup.ObsClient.EVENT_OUTPUTS)
+    except Exception as exc:
+        print(f"连不上 obs-websocket：{exc}", file=sys.stderr)
+        print("请确认 OBS 已开、工具 → WebSocket 服务器设置里已启用服务器。", file=sys.stderr)
+        return 2
+
+    ffmpeg = audio_qa.find_ffmpeg(None)
+    takes_total = args.takes
+    takes_done = 0
+    recording = bool(client.call("GetRecordStatus").get("outputActive"))
+    print(f"已连接 OBS（事件订阅已开）。用例：{args.case} · 目标 {takes_total} 段")
+    print("按【回车】开始录制 → 在游戏里按拍摄脚本操作 → 再按【回车】停止；"
+          "直接点 OBS 的开始/停止也一样能被接管。Ctrl+C 退出。\n")
+    if recording:
+        print("注意：OBS 当前正在录制，我先接管这一段。\n")
+
+    try:
+        while takes_done < takes_total:
+            if key_pressed():
+                key = msvcrt.getwch()
+                if key in ("\r", "\n"):
+                    try:
+                        if recording:
+                            client.call("StopRecord")
+                            print("已发送停止录制…")
+                        else:
+                            client.call("StartRecord")
+                            print("已开始录制 —— 现在照拍摄脚本操作，完事按回车停止。")
+                    except Exception as exc:
+                        # OBS 可能正处于 STARTING/STOPPING 之间，按键按早了不该让整个会话挂掉
+                        print(f"  这一下没生效（{exc}），稍等一秒再按。")
+                    time.sleep(0.5)
+            event = client.poll_event(0.2)
+            if event and event.get("eventType") == "RecordStateChanged":
+                action, path = interpret_record_event(event)
+                if action == "started":
+                    recording = True
+                    print("● 录制中…")
+                elif action == "stopped":
+                    recording = False
+                    print("■ 录制结束，正在处理…")
+                    time.sleep(1.2)   # 等 OBS 把文件写完
+                    if not path:
+                        path = str(client.call("GetRecordStatus").get("outputPath") or "")
+                    media = Path(path)
+                    if not media.is_file():
+                        print(f"  找不到录像文件（{path}），跳过这一段", file=sys.stderr)
+                        continue
+                    result = process_one(media, args.case, args.game, ffmpeg,
+                                         args.dropout_min_ms, args.force, quiet=True)
+                    print_summary(result)
+                    if result.get("env_filled"):
+                        print(f"  环境表已自动填：{'、'.join(result['env_filled'])}")
+                    takes_done += 1
+                    if takes_done < takes_total:
+                        print(f"\n第 {takes_done}/{takes_total} 段完成。按回车录下一段。\n")
+        print(f"\n{takes_total} 段全部处理完。")
+        print("接下来：填骨架的「四、结论」（其余已自动生成）→ "
+              "重建交付材料 → git 提交")
+        return 0
+    except KeyboardInterrupt:
+        print(f"\n已退出（本次处理了 {takes_done} 段）。")
+        return 0
+    finally:
+        client.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="session_runner", description="采集后的自动化流水线")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -465,6 +577,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     watch_parser = sub.add_parser("watch", parents=[common], help="监听 OBS 输出目录，自动处理新文件")
     watch_parser.add_argument("--dir", type=Path, required=True, help="OBS 录制输出目录")
 
+    auto_parser = sub.add_parser("auto", parents=[common],
+                                 help="绑定录制与处理：按回车开始/停止，停录后自动处理（需 OBS 已开 WebSocket）")
+    auto_parser.add_argument("--takes", type=int, default=3, help="本次要录几段（默认 3，对应 r01–r03）")
+
     shot = sub.add_parser("screenshot", help="让 OBS 截一张关键帧并归档（需 obs_control 的 IPC 已就绪）")
     shot.add_argument("--case", required=True)
     shot.add_argument("--game", default=DEFAULT_GAME)
@@ -472,6 +588,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     ffmpeg = audio_qa.find_ffmpeg(None)
+
+    if args.command == "auto":
+        return run_auto(args)
 
     if args.command == "watch":
         return watch(args)

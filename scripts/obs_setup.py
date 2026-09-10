@@ -220,9 +220,11 @@ def audio_plan(mode: str) -> tuple[str, str]:
 
 
 class ObsClient:
-    """极简 obs-websocket v5 客户端：只做请求/响应，够用即可。"""
+    """极简 obs-websocket v5 客户端：请求/响应 + 可选事件订阅。"""
 
-    def __init__(self, url: str = WS_URL) -> None:
+    EVENT_OUTPUTS = 1 << 6   # RecordStateChanged 属于 Outputs 事件类别
+
+    def __init__(self, url: str = WS_URL, events: int = 0) -> None:
         import websocket  # websocket-client
 
         self._ws = websocket.create_connection(url, timeout=30)
@@ -230,7 +232,7 @@ class ObsClient:
         if hello.get("op") != 0:
             raise RuntimeError(f"未收到 Hello：{hello}")
         data = hello["d"]
-        identify: dict[str, Any] = {"rpcVersion": 1, "eventSubscriptions": 0}
+        identify: dict[str, Any] = {"rpcVersion": 1, "eventSubscriptions": events}
         auth = data.get("authentication")
         if auth:
             identify["authentication"] = auth_string(
@@ -241,6 +243,33 @@ class ObsClient:
         if identified.get("op") != 2:
             raise RuntimeError(f"鉴权失败：{identified}")
         self.version = data.get("obsWebSocketVersion", "?")
+
+    def poll_event(self, timeout: float = 0.3) -> dict[str, Any] | None:
+        """非阻塞取一条事件；超时返回 None。
+
+        实现要点：**不能用 socket 超时来轮询**——websocket 的帧是分片读的，
+        在帧中途超时会把读取状态搞乱，后续事件就会静默丢失（实测：STARTED 收到、
+        STOPPED 丢）。改用 select 等「可读」再读，读到的总是完整帧。
+        同时只在**没有待响应请求**时调用，避免把请求响应当事件吃掉。
+        """
+        import select
+
+        sock = getattr(self._ws, "sock", None)
+        if sock is None:
+            return None
+        try:
+            ready, _, _ = select.select([sock], [], [], timeout)
+        except Exception:
+            return None
+        if not ready:
+            return None
+        try:
+            while True:
+                message = json.loads(self._ws.recv())
+                if message.get("op") == 5:
+                    return message["d"]
+        except Exception:
+            return None
 
     @staticmethod
     def _password() -> str:

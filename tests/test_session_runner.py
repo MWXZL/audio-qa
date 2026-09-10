@@ -99,6 +99,51 @@ class KeyframePlanTestCase(unittest.TestCase):
         self.assertLessEqual(plan[0][1], 0.4)
 
 
+class RecordEventTestCase(unittest.TestCase):
+    """OBS 录制状态事件的翻译——这是「按回车/点按钮都能被接管」的关键。"""
+
+    def test_started_event(self) -> None:
+        event = {"eventType": "RecordStateChanged",
+                 "eventData": {"outputActive": True, "outputState": "STARTED"}}
+        self.assertEqual(session_runner.interpret_record_event(event), ("started", ""))
+
+    def test_stopped_event_carries_output_path(self) -> None:
+        event = {"eventType": "RecordStateChanged",
+                 "eventData": {"outputActive": False, "outputState": "STOPPED",
+                               "outputPath": r"C:\tmp\a.mkv"}}
+        action, path = session_runner.interpret_record_event(event)
+        self.assertEqual(action, "stopped")
+        self.assertTrue(path.endswith("a.mkv"))
+
+    def test_stopping_is_not_terminal(self) -> None:
+        """STOPPING 只是过渡态：此时文件可能还没写完，不能据此处理文件。"""
+        event = {"eventData": {"outputActive": False, "outputState": "STOPPING"}}
+        self.assertEqual(session_runner.interpret_record_event(event)[0], "stopping")
+
+    def test_prefixed_state_strings_are_understood(self) -> None:
+        """OBS 实际发的是 OBS_WEBSOCKET_OUTPUT_* 前缀形式——按裸串匹配会全落空。"""
+        cases = {
+            "OBS_WEBSOCKET_OUTPUT_STARTED": "started",
+            "OBS_WEBSOCKET_OUTPUT_STOPPED": "stopped",
+            "OBS_WEBSOCKET_OUTPUT_STOPPING": "stopping",
+            "OBS_WEBSOCKET_OUTPUT_STARTING": "starting",
+        }
+        for state, expected in cases.items():
+            with self.subTest(state=state):
+                event = {"eventData": {"outputState": state,
+                                       "outputActive": state.endswith("STARTED"),
+                                       "outputPath": r"C:\tmp\x.mkv"}}
+                action, path = session_runner.interpret_record_event(event)
+                self.assertEqual(action, expected)
+                if state.endswith("STOPPED"):
+                    self.assertTrue(path.endswith("x.mkv"))
+
+    def test_unrelated_event_is_ignored(self) -> None:
+        self.assertEqual(session_runner.interpret_record_event({})[0], "other")
+        self.assertEqual(session_runner.interpret_record_event(
+            {"eventData": {"outputState": "RECONNECTED"}})[0], "other")
+
+
 class EnvironmentFillTestCase(unittest.TestCase):
     SKELETON = "\n".join([
         "# 用例",
