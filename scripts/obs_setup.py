@@ -53,6 +53,20 @@ GAME_TARGETS = {
 }
 PROCESS_PATTERN = "yuanshen"   # 默认值，保持向后兼容；实际以 detect_target() 的结果为准
 
+def _find_ffmpeg() -> str | None:
+    """探测 ffmpeg（配置阶段的实录取证需要它抽帧）。"""
+    import shutil
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+FFMPEG_FOR_PROBE = _find_ffmpeg()
 VIDEO_SETTINGS = {
     "capture_mode": "any_fullscreen",   # 不需手选窗口；游戏一进全屏就被抓到
     "capture_cursor": False,
@@ -335,6 +349,42 @@ class ObsClient:
             pass
 
 
+def probe_recording(client: "ObsClient", ffmpeg: str | None, seconds: float = 4.0) -> tuple[bool, str]:
+    """实录取证：录一小段并检查画面是否非纯色。
+
+    为什么不用 GetSourceScreenshot：实测在部分 OBS 会话里它一直返回
+    「Failed to render screenshot」，而同一时刻**实际录像是有画面的**。
+    用真实录制结果判断才可靠——毕竟我们最终要的就是录像。
+    """
+    if ffmpeg is None:
+        return (False, "没有 ffmpeg，无法校验画面")
+    import subprocess, tempfile
+    client.call("StartRecord")
+    time.sleep(seconds)
+    time.sleep(0.8)   # 给 OBS 一点时间收尾
+    try:
+        output = Path(client.call("StopRecord").get("outputPath") or "")
+    except Exception as exc:
+        return (False, f"录制失败：{exc}")
+    if not output.is_file():
+        return (False, "OBS 未返回录像文件")
+    with tempfile.TemporaryDirectory() as tmp:
+        frame = Path(tmp) / "probe.png"
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-ss", "1",
+                        "-i", str(output), "-frames:v", "1", "-q:v", "2", str(frame)],
+                       capture_output=True)
+        size = frame.stat().st_size if frame.is_file() else 0
+    # OBS 停止录制后文件句柄可能还占着一小会儿：删不掉也不能让配置失败（runtime/ 已被 git 忽略）
+    for _ in range(6):
+        try:
+            output.unlink()
+            break
+        except OSError:
+            time.sleep(0.5)
+    if size > 30_000:
+        return (True, f"实录取证通过（帧 {size // 1024} KB）")
+    return (False, f"实录画面疑似纯色（帧 {size // 1024} KB）")
+
 def configure(client: ObsClient, audio_mode: str = "desktop", scene: str = SCENE_NAME,
               process: str | None = None) -> list[str]:
     notes: list[str] = []
@@ -407,6 +457,17 @@ def configure(client: ObsClient, audio_mode: str = "desktop", scene: str = SCENE
     except Exception as exc:
         notes.append(f"!! 音轨设置失败：{exc}")
 
+    # 幂等保护：当前场景若已经有一个能出画面的源，就**不要动它**。
+    # 血泪教训：OBS 的源是全局的、被场景引用时删不掉，反复跑 configure 会把
+    # 已经配好的场景改坏（实测把可用的星铁场景搞成录出来全黑）。
+    existing_items = [it["sourceName"] for it in
+                      client.call("GetSceneItemList", sceneName=scene).get("sceneItems", [])]
+    if existing_items:
+        ok, detail = probe_recording(client, FFMPEG_FOR_PROBE)
+        if ok:
+            notes.append(f"当前场景已有可用画面源 {existing_items}（{detail}）——保持不变，跳过画面配置")
+            skip_video = True
+
     # 画面源：按窗口是否铺满屏幕选种类，**建源时就把窗口值带上**，并且**回头验证**。
     # 实测教训：window 为空字符串时 OBS 会把窗口采集源丢掉——API 报成功但源并不存在，
     # 只信返回值就会得到「配好了」的假象，最后录出全黑。
@@ -415,7 +476,10 @@ def configure(client: ObsClient, audio_mode: str = "desktop", scene: str = SCENE
     candidates = video_candidates(fullscreen)
     notes.append(f"游戏窗口 {rect} / 屏幕 {screen_size()} → 候选捕获方式 {candidates}")
 
+    skip_video = locals().get("skip_video", False)
     for kind in candidates:
+        if skip_video:
+            break
         if VIDEO_SOURCE in inputs and inputs[VIDEO_SOURCE].get("inputKind") != kind:
             client.call("RemoveInput", inputName=VIDEO_SOURCE)
             inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
@@ -455,45 +519,40 @@ def configure(client: ObsClient, audio_mode: str = "desktop", scene: str = SCENE
 
         inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
         if VIDEO_SOURCE not in inputs:
-            notes.append(f"!! OBS 没保留 {kind} 源（窗口值为空时会被丢弃），换下一种方式")
+            notes.append(f"!! OBS 没保留 {kind} 源，换下一种方式")
             continue
-        size = 0
-        last_error = ""
-        for _attempt in range(4):   # 首帧可能要等一会儿才渲染出来
+        # 关键：源可能存在但**不在目标场景里**（换场景时最容易踩，表现为录出来全黑）
+        scene_items = [it["sourceName"] for it in
+                       client.call("GetSceneItemList", sceneName=scene).get("sceneItems", [])]
+        if VIDEO_SOURCE not in scene_items:
             try:
-                size = source_screenshot_size(client, VIDEO_SOURCE)
-                last_error = ""
+                client.call("CreateSceneItem", sceneName=scene, sourceName=VIDEO_SOURCE,
+                            sceneItemEnabled=True)
+                notes.append(f"把已有源「{VIDEO_SOURCE}」加入场景 {scene}")
             except Exception as exc:
-                size = 0
-                last_error = str(exc)[:60]
-            if size > 20000:
-                break
-            time.sleep(1.0)
-        if size <= 20000:
-            notes.append(f"!! {kind} 画面仍不可用（截图 {size} 字节{('，' + last_error) if last_error else ''}），换下一种方式")
-            try:
-                client.call("RemoveInput", inputName=VIDEO_SOURCE)
-                inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
-            except Exception:
-                pass
+                notes.append(f"!! 该源无法加入场景（{str(exc)[:40]}），换用新名字重建")
+                try:
+                    client.call("RemoveInput", inputName=VIDEO_SOURCE)
+                except Exception:
+                    pass
+                continue
+        ok, detail = probe_recording(client, FFMPEG_FOR_PROBE)
+        if not ok:
+            notes.append(f"!! {kind} 画面不可用（{detail}），换下一种方式")
             continue
-        if size > 20000:
-            notes.append(f"画面源 {VIDEO_SOURCE} = {kind} · 源截图 {size // 1024} KB → 有画面 ✓")
-            try:
-                item_id = client.call("GetSceneItemId", sceneName=scene,
-                                      sourceName=VIDEO_SOURCE)["sceneItemId"]
-                client.call("SetSceneItemTransform", sceneName=scene, sceneItemId=item_id,
-                            sceneItemTransform={"positionX": 0, "positionY": 0,
-                                                "boundsType": "OBS_BOUNDS_SCALE_INNER",
-                                                "boundsAlignment": 0,
-                                                "boundsWidth": 1920, "boundsHeight": 1080})
-                notes.append("画面已缩放到 1920x1080 画布（避免被裁切）")
-            except Exception as exc:
-                notes.append(f"（画面缩放未设置：{exc}）")
-            break
-        notes.append(f"画面源 {kind} 的源截图只有 {size} 字节（黑屏/纯色），换下一种方式")
-        client.call("RemoveInput", inputName=VIDEO_SOURCE)
-        inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
+        notes.append(f"画面源 {VIDEO_SOURCE} = {kind} · {detail} ✓")
+        try:
+            item_id = client.call("GetSceneItemId", sceneName=scene,
+                                  sourceName=VIDEO_SOURCE)["sceneItemId"]
+            client.call("SetSceneItemTransform", sceneName=scene, sceneItemId=item_id,
+                        sceneItemTransform={"positionX": 0, "positionY": 0,
+                                            "boundsType": "OBS_BOUNDS_SCALE_INNER",
+                                            "boundsAlignment": 0,
+                                            "boundsWidth": 1920, "boundsHeight": 1080})
+            notes.append("画面已缩放到 1920x1080 画布（避免被裁切）")
+        except Exception as exc:
+            notes.append(f"（画面缩放未设置：{exc}）")
+        break
 
     # 音频通路：按实测结论选（默认系统混音），启用的那个只写轨道 1，另一个静音避免叠声
     enable_name, mute_name = audio_plan(audio_mode)
