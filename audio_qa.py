@@ -47,7 +47,7 @@ from typing import Any, Iterable, Sequence
 
 VERSION = "0.1.0"
 
-DEFAULT_EXTS = (".wav", ".ogg", ".mp3", ".flac", ".aif", ".aiff", ".m4a")
+DEFAULT_EXTS = (".wav", ".ogg", ".mp3", ".flac", ".aif", ".aiff", ".m4a", ".mka")
 
 SEVERITY_ORDER = {"PASS": 0, "INFO": 1, "WARN": 2, "FAIL": 3}
 
