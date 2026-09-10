@@ -87,7 +87,9 @@ class CheckCaptureTestCase(unittest.TestCase):
         ffmpeg = audio_qa.find_ffmpeg(None)
         if ffmpeg is None:
             self.skipTest("需要 ffmpeg 才能测量响度")
-        path = write_wav(self.root / "quiet.wav", channels=2, seconds=6.0, amplitude=0.0008)
+        # 振幅取 0.004：峰值约 -48 dBFS（高于 -60 的静音阈值，不会被判成静音），
+        # 对应响度约 -50 LUFS（低于 -45 的「电平过低」阈值）——正好落在要测的那条判据上。
+        path = write_wav(self.root / "quiet.wav", channels=2, seconds=6.0, amplitude=0.004)
         verdict, problems, _hints, _measure = check_capture.check(path, ffmpeg)
         self.assertEqual(verdict, "有警告但可用")
         self.assertTrue(any("LUFS" in item for item in problems))
