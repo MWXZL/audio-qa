@@ -1,0 +1,38 @@
+# 本仓库只发布自研代码与自产证据，不发布第三方内容。
+# 注意：gitignore 不支持行内注释，每条注释必须单独成行，否则整行会被当成模式。
+
+# 第三方内容：不能重新发布
+# Audiokinetic 官方 Cube 示例工程（约 3.5 GB），受其许可约束
+CubeWwise/
+# 外部音效素材与原下载包，许可不允许再分发
+assets/
+assets_raw/
+# 从 Cube 工程提取的中间产物，源文件属于 Audiokinetic
+cube/
+
+# 大体量运行时产物：本地保留，不进版本库
+# 现场录制与临时输出（含 OBS 原始录像）
+runtime/
+captures/recordings/*.mkv
+
+# 个人信息文件不入库
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log
+
+# 本地临时目录
+_t/
+.pytest-tmp/
