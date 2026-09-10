@@ -103,6 +103,16 @@ class FieldSessionTestCase(unittest.TestCase):
         text = self.session(directory)["skeleton"].read_text(encoding="utf-8")
         self.assertNotIn("命名提醒", text)
 
+    def test_repeat_count_is_prefilled_from_clip_count(self) -> None:
+        """三段重复录制时，「执行次数」与「复现率」应自动按片段数预填，避免手写出错。"""
+        directory = self.root / "bug_03_music"
+        for index in (1, 2, 3):
+            write_wav(directory / f"raw_20260910_bug_03_r{index:02d}.wav", sine(1.0))
+        text = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("- 执行次数：3（本目录内 3 个片段）", text)
+        self.assertIn("- 复现率：__ / 3", text)
+        self.assertIn("不要为每一段单独下一个结论", text)
+
     def test_audio_only_names_are_recognised(self) -> None:
         """纯音频方案下归档出来的是 .mka/.m4a——命名规则必须认，否则会被误报不合规。"""
         for name in ("raw_20260910_bug_03_r01.mka", "raw_20260910_bug_03_r02.m4a",
