@@ -57,9 +57,127 @@ def naming_findings(report: dict[str, Any]) -> list[str]:
     return [item["path"] for item in report["files"] if not NAME_PATTERN.match(Path(item["path"]).name)]
 
 
+def host_environment() -> dict[str, str]:
+    """能自动确定的环境字段：系统 / 平台 / OBS 采集设置。
+
+    放在骨架生成里（而不是调用方），因为骨架会因重新测量而被重写——
+    预填如果依赖调用方补，重写一次就丢了（实测踩过）。
+    这里只读机器侧事实与 OBS 配置文件，不依赖 OBS 是否在运行。
+    """
+    import configparser
+    import ctypes
+    import os
+    import platform
+    import winreg
+
+    values: dict[str, str] = {}
+    try:
+        user32 = ctypes.windll.user32
+        screen = f"{user32.GetSystemMetrics(0)}x{user32.GetSystemMetrics(1)}"
+    except Exception:
+        screen = ""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            cpu = str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+    except Exception:
+        cpu = (platform.processor() or "未知 CPU").strip()
+    values["平台 / 型号"] = " · ".join(
+        part for part in (cpu, platform.platform(), f"屏幕 {screen}" if screen else "") if part
+    )
+    values["系统版本"] = f"{platform.system()} {platform.release()}（{platform.version()}）"
+
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return values
+    root = Path(appdata) / "obs-studio"
+    profile = "未命名"
+    user_ini = root / "user.ini"
+    if user_ini.is_file():
+        for line in user_ini.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Profile="):
+                profile = line.split("=", 1)[1].strip() or profile
+    ini = root / "basic" / "profiles" / profile / "basic.ini"
+    if not ini.is_file():
+        return values
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read(ini, encoding="utf-8-sig")   # OBS 的 ini 带 BOM，不用 utf-8-sig 会解析失败
+    except Exception:
+        return values
+
+    def get(section: str, key: str) -> str:
+        return (parser.get(section, key, fallback="") or "").strip()
+
+    parts = [
+        f"{get('Video', 'BaseCX') or '?'}x{get('Video', 'BaseCY') or '?'}",
+        f"{get('Video', 'FPSCommon')} fps" if get("Video", "FPSCommon") else "",
+        f"{get('Audio', 'SampleRate')} Hz {get('Audio', 'ChannelSetup')}".strip()
+        if get("Audio", "SampleRate") else "",
+        get("SimpleOutput", "RecFormat2") or get("AdvOut", "RecFormat"),
+        f"轨道 {get('SimpleOutput', 'RecTracks') or get('AdvOut', 'RecTracks')}"
+        if (get("SimpleOutput", "RecTracks") or get("AdvOut", "RecTracks")) else "",
+    ]
+    values["采集设置（OBS 分辨率 / 帧率 / 采样率 / 轨道）"] = " / ".join(p for p in parts if p and "?" not in p)
+    return values
+
+HUMAN_LINE_PREFIXES = ("- 结论", "- 执行次数：", "- 复现率：", "- 各段是否", "- 预期：",
+                       "- 实际", "- 关键时间码：", "- 是否升级为缺陷", "- 其它备注：")
+
+
+def preserve_human_edits(new_text: str, previous_path: Path) -> str:
+    """重新生成骨架时，保留已有文件里**人工填写**的内容。
+
+    为什么必须做：骨架会因重新测量而被重写，而结论是人写的。
+    实测踩过：补测一段后重跑测量，手写的 PASS/预期/实际全被清空。
+    规则：环境表取非空格；结论段取冒号后有内容的行——只回填这两类。
+    """
+    if not previous_path.is_file():
+        return new_text
+    old = previous_path.read_text(encoding="utf-8")
+    kept: dict[str, str] = {}
+    for line in old.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.count("|") >= 3:
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if len(cells) >= 2 and cells[1] and cells[0] not in {"项目", "---"}:
+                kept[f"env:{cells[0]}"] = cells[1]
+        for prefix in HUMAN_LINE_PREFIXES:
+            if stripped.startswith(prefix):
+                tail = stripped[len(prefix):].strip()
+                if tail:
+                    kept[f"line:{prefix}"] = stripped
+    if not kept:
+        return new_text
+
+    out: list[str] = []
+    for line in new_text.splitlines():
+        stripped = line.strip()
+        replaced = False
+        if stripped.startswith("|") and stripped.count("|") >= 3:
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if len(cells) >= 2 and not cells[1]:
+                value = kept.get(f"env:{cells[0]}")
+                if value:
+                    out.append(f"| {cells[0]} | {value} |")
+                    replaced = True
+        if not replaced:
+            for prefix in HUMAN_LINE_PREFIXES:
+                if stripped.startswith(prefix):
+                    value = kept.get(f"line:{prefix}")
+                    if value:
+                        out.append(value)
+                        replaced = True
+                    break
+        if not replaced:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
 def render_skeleton(
     case: str, report: dict[str, Any], directory: Path, dropout_min_ms: float
 ) -> str:
+    env = host_environment()
     files = report["files"]
     gaps = gap_entries(report)
     off_naming = naming_findings(report)
@@ -76,12 +194,12 @@ def render_skeleton(
         "| 项目 | 内容 |",
         "| --- | --- |",
         "| 游戏 / 版本 |  |",
-        "| 平台 / 型号 |  |",
-        "| 系统版本 |  |",
+        f"| 平台 / 型号 | {env.get('平台 / 型号', '')} |",
+        f"| 系统版本 | {env.get('系统版本', '')} |",
         "| 输出设备 |  |",
         "| 游戏音频设置 |  |",
         "| 其他音频开关（蓝牙编码 / 空间音效 / 独占模式） |  |",
-        "| 采集设置（OBS 分辨率 / 帧率 / 采样率 / 轨道） |  |",
+        f"| 采集设置（OBS 分辨率 / 帧率 / 采样率 / 轨道） | {env.get('采集设置（OBS 分辨率 / 帧率 / 采样率 / 轨道）', '')} |",
         "| 网络与并发情况 |  |",
         "",
         "## 二、客观测量（自动生成，可直接引用）",
@@ -200,6 +318,7 @@ def run_session(
     )
     skeleton = render_skeleton(resolved_case, report, directory.resolve(), dropout_min_ms)
     target = directory / f"{resolved_case}_现场记录.md"
+    skeleton = preserve_human_edits(skeleton, target)
     target.write_text(skeleton, encoding="utf-8")
     return {"report": report, "skeleton": target, "case": resolved_case, "ffmpeg": ffmpeg}
 

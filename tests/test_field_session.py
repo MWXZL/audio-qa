@@ -103,6 +103,22 @@ class FieldSessionTestCase(unittest.TestCase):
         text = self.session(directory)["skeleton"].read_text(encoding="utf-8")
         self.assertNotIn("命名提醒", text)
 
+    def test_human_edits_survive_regeneration(self) -> None:
+        """重新测量会重写骨架，但人工填的结论与环境字段必须保住（实测被清空过）。"""
+        directory = self.root / "bug_03_music"
+        write_wav(directory / "raw_20260910_bug_03_r01.wav", sine(1.0))
+        skeleton = self.session(directory)["skeleton"]
+        text = skeleton.read_text(encoding="utf-8")
+        text = text.replace("| 游戏 / 版本 |  |", "| 游戏 / 版本 | 崩坏：星穹铁道 4.4 |")
+        text = text.replace("- 结论（PASS / FAIL / BLOCKED / 未复现）：", "- 结论（PASS / FAIL / BLOCKED / 未复现）：PASS")
+        text = text.replace("- 实际（写可观察事实 + 时间码）：", "- 实际：三次均正常")
+        skeleton.write_text(text, encoding="utf-8")
+
+        again = self.session(directory)["skeleton"].read_text(encoding="utf-8")
+        self.assertIn("| 游戏 / 版本 | 崩坏：星穹铁道 4.4 |", again)
+        self.assertIn("：PASS", again)
+        self.assertIn("三次均正常", again)
+
     def test_repeat_count_is_prefilled_from_clip_count(self) -> None:
         """三段重复录制时，「执行次数」与「复现率」应自动按片段数预填，避免手写出错。"""
         directory = self.root / "bug_03_music"

@@ -252,7 +252,7 @@ def obs_profile_settings() -> dict[str, str]:
     parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
     try:
-        parser.read(ini, encoding="utf-8")
+        parser.read(ini, encoding="utf-8-sig")   # OBS 的 ini 带 BOM，不用 utf-8-sig 会解析失败
     except Exception:
         return {}
 
