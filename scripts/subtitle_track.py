@@ -93,21 +93,72 @@ def candidate_bands(top: float = 0.55, bottom: float = 0.97, height: float = 0.0
     return bands
 
 
-def choose_band(media: Path, ffmpeg: str, fps: float = 2.0, width: int = 240,
-                top: float = 0.55, bottom: float = 0.97, height: float = 0.06,
-                step: float = 0.02) -> tuple[tuple[float, float], list[dict[str, Any]]]:
-    """自动找出字幕条所在的横条，返回 (选中区间, 全部候选的评分表)。
+def probe_thumbnails(media: Path, ffmpeg: str, fps: float = 2.0, seconds: float = 40.0,
+                     width: int = 160) -> Any:
+    """一次性取一小段**整屏**灰度缩略帧（N, H, W）。
 
-    为什么必须自动找：字幕条位置随游戏与分辨率变（战斗界面的技能栏就在最下方，
-    血条与提示又会挤在同一带），猜错会把技能栏当成字幕，量出一堆假句。
-    评分依据见 `band_score`：字幕条「平时暗、偶尔亮」，常亮 UI 比值接近 1。
+    为什么不在每条候选横条上各跑一次 ffmpeg：那要解码整段录像 40 多次，慢到不可用。
+    先整屏取一次低分辨率帧，横条评分全部在内存里算。
     """
-    table: list[dict[str, Any]] = []
-    for band in candidate_bands(top, bottom, height, step):
-        brights, _ = probe_band(media, ffmpeg, band, fps, width)
-        table.append({"band": band, "score": round(band_score(brights), 2),
-                      "peak": round(max(brights), 2) if brights else 0.0,
-                      "low": round(sorted(brights)[len(brights) // 4], 2) if brights else 0.0})
+    import numpy as np
+
+    filter_chain = f"fps={fps},scale={width}:-2,format=gray"
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "thumb.raw"
+        done = subprocess.run([ffmpeg, "-v", "error", "-t", f"{seconds:.1f}", "-i", str(media),
+                               "-vf", filter_chain, "-f", "rawvideo", "-pix_fmt", "gray", str(raw)],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if done.returncode != 0 or not raw.is_file() or raw.stat().st_size == 0:
+            raise RuntimeError(f"取缩略帧失败：{(done.stderr or '').strip()[:200]}")
+        buffer = raw.read_bytes()
+    flat = np.frombuffer(buffer, dtype=np.uint8)
+    height = _scaled_height(media, ffmpeg, width)
+    frame_pixels = width * height
+    count = len(flat) // frame_pixels
+    if count < 2:
+        raise RuntimeError("缩略帧不足 2 帧")
+    return flat[: count * frame_pixels].reshape(count, height, width)
+
+
+def _scaled_height(media: Path, ffmpeg: str, width: int) -> int:
+    """整屏缩略帧的高度。"""
+    done = subprocess.run(
+        [ffmpeg, "-v", "error", "-i", str(media), "-vf", f"scale={width}:-2,format=gray",
+         "-frames:v", "1", "-f", "rawvideo", "-"],
+        capture_output=True)
+    if done.returncode != 0 or not done.stdout:
+        raise RuntimeError("无法确定缩略帧尺寸")
+    return len(done.stdout) // width
+
+
+def band_scores(frames: Any, bands: Sequence[tuple[float, float]] | None = None) -> list[dict[str, Any]]:
+    """在整屏缩略帧上给每条候选横条打分。纯函数（只依赖 numpy 数组）。"""
+    import numpy as np
+
+    count, height, _ = frames.shape
+    rows: list[dict[str, Any]] = []
+    for top, bottom in (bands if bands is not None else candidate_bands()):
+        y0, y1 = int(top * height), max(int(bottom * height), int(top * height) + 1)
+        band = frames[:, y0:y1, :]
+        brights = (band > BRIGHT_PIXEL).mean(axis=(1, 2)) * 100.0
+        rows.append({"band": (top, bottom), "score": round(band_score(list(brights)), 2),
+                     "peak": round(float(brights.max()), 2),
+                     "low": round(float(np.percentile(brights, 25)), 2)})
+    return rows
+
+
+def choose_band(media: Path, ffmpeg: str, fps: float = 2.0, seconds: float = 40.0,
+                width: int = 160, top: float = 0.05, bottom: float = 0.99,
+                height: float = 0.06, step: float = 0.02
+                ) -> tuple[tuple[float, float], list[dict[str, Any]]]:
+    """自动找出「字幕 / 文本」所在的横条，返回 (选中区间, 全部候选的评分表)。
+
+    为什么必须自动找：位置随游戏与界面变——战斗界面的技能栏在最下方，角色面板的文本在
+    画面中部，而血条、小地图、提示又会挤在同一带。猜错会把技能栏当成字幕，量出一堆假句。
+    评分依据见 `band_score`：字幕条「平时暗、偶尔整行亮」，常亮 UI 比值接近 1。
+    """
+    frames = probe_thumbnails(media, ffmpeg, fps, seconds, width)
+    table = band_scores(frames, candidate_bands(top, bottom, height, step))
     if not table:
         raise RuntimeError("候选横条为空")
     best = max(table, key=lambda item: item["score"])
@@ -334,8 +385,9 @@ def process(media: Path, out_dir: Path, ffmpeg: str, args: argparse.Namespace,
     region = args.region
     band_table: list[dict[str, Any]] = []
     if args.auto_region:
-        region, band_table = choose_band(media, ffmpeg, args.scan_fps, args.width)
-        print(f"  自动选定的字幕条：画面高度 {region[0] * 100:.0f}%–{region[1] * 100:.0f}%"
+        region, band_table = choose_band(media, ffmpeg, args.scan_fps, args.scan_seconds,
+                                         step=args.scan_step)
+        print(f"  自动选定的文本横条：画面高度 {region[0] * 100:.0f}%–{region[1] * 100:.0f}%"
               f"（评分 {max(item['score'] for item in band_table):.2f}）")
     brights, changes = probe_band(media, ffmpeg, region, args.fps, args.width)
     states = states_from_signals(brights, changes, args.fps, args.bright_floor,
@@ -374,8 +426,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="字幕横条的纵向范围（画面高度的比例，如 0.72,0.96）；"
                              "用 --auto-region 时此项被忽略")
     parser.add_argument("--auto-region", action="store_true",
-                        help="自动找出字幕条所在的横条（推荐：战斗界面的技能栏也在最下方）")
-    parser.add_argument("--scan-fps", type=float, default=2.0, help="自动找字幕条时的采样帧率")
+                        help="自动找出「字幕 / 文本」所在的横条（推荐：不同界面的位置不一样）")
+    parser.add_argument("--scan-fps", type=float, default=2.0, help="自动找横条时的采样帧率")
+    parser.add_argument("--scan-seconds", type=float, default=40.0,
+                        help="自动找横条时只看开头这么多秒（默认 40，够覆盖多句）")
+    parser.add_argument("--scan-step", type=float, default=0.02, help="候选横条的滑动步长")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="采样帧率（默认 5）")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="判据用小图宽度")
     parser.add_argument("--change", type=float, default=MASK_CHANGE,
