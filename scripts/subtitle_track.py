@@ -67,6 +67,53 @@ def brightness(band_frames: Any) -> list[float]:
     return [float((row > BRIGHT_PIXEL).mean() * 100.0) for row in band_frames]
 
 
+def band_score(brights: Sequence[float]) -> float:
+    """给一条横条打「像不像字幕条」的分。纯函数。
+
+    字幕条的特征是「平时几乎没有亮点、偶尔整行亮起来」，而血条/技能栏/小地图那种 UI
+    是**一直亮着**。所以取 95 分位与 25 分位的比值：字幕条接近无穷（低分位≈0），
+    常亮 UI 接近 1。分母设下限是为了避免除以 0，以及给「一直很暗」的空条一个低分。
+    """
+    if not brights:
+        return 0.0
+    values = sorted(brights)
+    low = values[int(len(values) * 0.25)]
+    high = values[int(len(values) * 0.95)]
+    return high / max(low, 0.05)
+
+
+def candidate_bands(top: float = 0.55, bottom: float = 0.97, height: float = 0.06,
+                    step: float = 0.02) -> list[tuple[float, float]]:
+    """候选横条（自上而下等步长滑动）。纯函数。"""
+    bands: list[tuple[float, float]] = []
+    start = top
+    while start + height <= bottom + 1e-9:
+        bands.append((round(start, 3), round(start + height, 3)))
+        start = round(start + step, 3)
+    return bands
+
+
+def choose_band(media: Path, ffmpeg: str, fps: float = 2.0, width: int = 240,
+                top: float = 0.55, bottom: float = 0.97, height: float = 0.06,
+                step: float = 0.02) -> tuple[tuple[float, float], list[dict[str, Any]]]:
+    """自动找出字幕条所在的横条，返回 (选中区间, 全部候选的评分表)。
+
+    为什么必须自动找：字幕条位置随游戏与分辨率变（战斗界面的技能栏就在最下方，
+    血条与提示又会挤在同一带），猜错会把技能栏当成字幕，量出一堆假句。
+    评分依据见 `band_score`：字幕条「平时暗、偶尔亮」，常亮 UI 比值接近 1。
+    """
+    table: list[dict[str, Any]] = []
+    for band in candidate_bands(top, bottom, height, step):
+        brights, _ = probe_band(media, ffmpeg, band, fps, width)
+        table.append({"band": band, "score": round(band_score(brights), 2),
+                      "peak": round(max(brights), 2) if brights else 0.0,
+                      "low": round(sorted(brights)[len(brights) // 4], 2) if brights else 0.0})
+    if not table:
+        raise RuntimeError("候选横条为空")
+    best = max(table, key=lambda item: item["score"])
+    return tuple(best["band"]), table  # type: ignore[return-value]
+
+
 def mask_changes(band_frames: Any) -> list[float]:
     """逐帧「亮暗类别翻转」的像素占比（%）。纯函数。
 
@@ -215,15 +262,38 @@ def cut_clips(media: Path, ffmpeg: str, states: Sequence[dict[str, Any]], out_di
     return written
 
 
-def render(media: Path, states: Sequence[dict[str, Any]], fps: float) -> str:
+def render(media: Path, states: Sequence[dict[str, Any]], fps: float,
+           region: tuple[float, float] | None = None,
+           band_table: Sequence[dict[str, Any]] = ()) -> str:
     lines = [
         f"# 字幕时间线：`{media.name}`",
         "",
-        f"- 采样帧率 {fps:g} fps → 时间码精度 ±{1 / fps:.2f} s；",
-        "- 判据：字幕条灰度的逐帧平均绝对差超过阈值即判为一次变化（**不做 OCR**，只量时刻）；",
+        f"- 采样帧率 {fps:g} fps → 时间码精度 ±{1 / fps:.2f} s；"
+        + (f"字幕条取画面高度 {region[0] * 100:.0f}%–{region[1] * 100:.0f}%"
+           f"（{'自动选定' if band_table else '手动指定'}）；" if region else ""),
+        "- 判据：字幕条**亮点占比**判断这一带有无字幕、**亮暗翻转占比**判断字幕是否换行"
+        "（**不做 OCR**，只量时刻）；",
         "- 「字幕原文」列要人看截图抄写：截图同时含字幕与对话界面；",
         f"- 检出含字幕的状态：{len(states)} 个。",
         "",
+    ]
+    if band_table:
+        best = max(band_table, key=lambda item: item["score"])
+        lines += [
+            "## 为什么选这条横条",
+            "",
+            "字幕条的特征是「平时几乎没有亮点、偶尔整行亮起」，常亮的血条 / 技能栏 / 小地图不是。"
+            "评分 = 亮占比 95 分位 / 25 分位（越低分位接近 0 越像字幕条）。",
+            "",
+            "| 横条（画面高度 %） | 评分 | 峰值亮占比(%) | 低分位亮占比(%) |",
+            "| --- | --- | --- | --- |",
+        ]
+        for item in sorted(band_table, key=lambda row: -row["score"])[:5]:
+            mark = " ← 选用" if item["band"] == best["band"] else ""
+            lines.append(f"| {item['band'][0] * 100:.0f}–{item['band'][1] * 100:.0f}{mark} |"
+                         f" {item['score']} | {item['peak']} | {item['low']} |")
+        lines.append("")
+    lines += [
         "| 序号 | 字幕出现(s) | 字幕消失(s) | 时长(s) | 亮度占比(%) | 截图 | 音频片段 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
@@ -261,21 +331,29 @@ def baseline_tsv(states: Sequence[dict[str, Any]]) -> str:
 
 def process(media: Path, out_dir: Path, ffmpeg: str, args: argparse.Namespace,
             prefix: str = "") -> dict[str, Any]:
-    brights, changes = probe_band(media, ffmpeg, args.region, args.fps, args.width)
+    region = args.region
+    band_table: list[dict[str, Any]] = []
+    if args.auto_region:
+        region, band_table = choose_band(media, ffmpeg, args.scan_fps, args.width)
+        print(f"  自动选定的字幕条：画面高度 {region[0] * 100:.0f}%–{region[1] * 100:.0f}%"
+              f"（评分 {max(item['score'] for item in band_table):.2f}）")
+    brights, changes = probe_band(media, ffmpeg, region, args.fps, args.width)
     states = states_from_signals(brights, changes, args.fps, args.bright_floor,
                                  args.change, args.min_state)
+    args.region = region
     if states:
         crop_shots(media, ffmpeg, states, out_dir, prefix, args.shot_width)
         if args.clips:
             cut_clips(media, ffmpeg, states, out_dir, prefix)
     stem = media.stem
     (out_dir / f"{stem}_字幕时间线.json").write_text(
-        json.dumps({"file": media.name, "fps": args.fps, "region": list(args.region),
+        json.dumps({"file": media.name, "fps": args.fps, "region": list(region),
+                    "auto_region": bool(args.auto_region), "band_table": band_table,
                     "states": states}, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / f"{stem}_字幕基线.tsv").write_text(baseline_tsv(states), encoding="utf-8")
-    (out_dir / f"{stem}_字幕时间线.md").write_text(render(media, states, args.fps),
-                                                   encoding="utf-8")
-    return {"file": media.name, "states": len(states),
+    (out_dir / f"{stem}_字幕时间线.md").write_text(
+        render(media, states, args.fps, region, band_table), encoding="utf-8")
+    return {"file": media.name, "states": len(states), "region": region,
             "median_bright": round(statistics.median([s["bright"] for s in states]), 2)
             if states else 0.0}
 
@@ -293,7 +371,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("path", type=Path, help="录像文件或目录")
     parser.add_argument("--out", type=Path, required=True, help="产出目录")
     parser.add_argument("--region", default=f"{DEFAULT_REGION[0]},{DEFAULT_REGION[1]}",
-                        help="字幕横条的纵向范围（画面高度的比例，如 0.72,0.96）")
+                        help="字幕横条的纵向范围（画面高度的比例，如 0.72,0.96）；"
+                             "用 --auto-region 时此项被忽略")
+    parser.add_argument("--auto-region", action="store_true",
+                        help="自动找出字幕条所在的横条（推荐：战斗界面的技能栏也在最下方）")
+    parser.add_argument("--scan-fps", type=float, default=2.0, help="自动找字幕条时的采样帧率")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="采样帧率（默认 5）")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="判据用小图宽度")
     parser.add_argument("--change", type=float, default=MASK_CHANGE,

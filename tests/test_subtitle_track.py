@@ -127,6 +127,24 @@ class BaselineTsvTestCase(unittest.TestCase):
         self.assertEqual(row[5], "")              # 字幕原文留空待抄
 
 
+class BandChoiceTestCase(unittest.TestCase):
+    """自动找字幕条：战斗界面的技能栏与血条也在下方，猜错会把 UI 当成字幕。"""
+
+    def test_score_prefers_dark_band_with_occasional_text(self) -> None:
+        subtitle_like = [0.0] * 80 + [1.2] * 20      # 平时全暗、偶尔整行亮
+        hud_like = [2.0] * 100                       # 一直亮着
+        self.assertGreater(st.band_score(subtitle_like), 10 * st.band_score(hud_like))
+
+    def test_score_of_always_dark_band_is_low(self) -> None:
+        """整条一直很暗（画面里没有这一带）不能拿高分，否则会选到空白的边角。"""
+        self.assertLessEqual(st.band_score([0.0] * 100), 1.0)
+
+    def test_candidate_bands_cover_the_lower_half(self) -> None:
+        bands = st.candidate_bands()
+        self.assertGreater(len(bands), 10)
+        self.assertTrue(all(0.55 <= start and end <= 0.98 for start, end in bands))
+
+
 class SyntheticVideoTestCase(unittest.TestCase):
     """端到端：合成一段已知字幕时刻的录像，断言检出结果就是那三段。"""
 
@@ -143,6 +161,18 @@ class SyntheticVideoTestCase(unittest.TestCase):
             [str(video), "--out", str(out), "--fps", "10"] + list(extra or []))
         args.region = tuple(float(part) for part in str(args.region).split(","))
         return st.process(video, out, audio_qa.find_ffmpeg(None), args)
+
+    def test_auto_region_end_to_end(self) -> None:
+        """自动选横条时也要量出同样的三句——否则这个开关只是个摆设。"""
+        video = self.root / "synthetic.mkv"
+        if not make_video(video):
+            self.skipTest("需要 ffmpeg 与 Pillow 才能生成合成录像")
+        out = self.root / "auto"
+        result = self.run_tool(video, out, ["--auto-region"])
+        self.assertEqual(result["states"], len(LINES))
+        self.assertLessEqual(result["region"][0], 0.81)
+        report = (out / "synthetic_字幕时间线.md").read_text(encoding="utf-8")
+        self.assertIn("为什么选这条横条", report)
 
     def test_detects_the_known_subtitle_times(self) -> None:
         video = self.root / "synthetic.mkv"
