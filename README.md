@@ -36,9 +36,8 @@ python scripts/field_session.py captures/target-game/genshin-1.0/bug_01_concurre
 # 语音-字幕对齐检查（四类差异 + offset 统计；阈值标注为待校准草案）
 python scripts/asr_align.py --baseline baseline.tsv --asr asr.json --out align.md
 
-
 # 测试
-python -m pytest tests -q      # 89 passed
+python -m pytest tests -q      # 274 passed
 ```
 
 ## 工具组成

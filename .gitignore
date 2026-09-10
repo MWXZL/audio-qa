@@ -24,11 +24,18 @@ runtime/
 *.mov
 *.flac
 
+# 证据与生成物留在本地：仓库只发布工具链与判据文档。
+# captures/ 是现场采集的证据（测量报告、关键帧、无损音轨），供交付目录使用；
+# 几个根目录产物（cube/full/baseline_hashes）是工具扫描输出，可由命令重新生成。
+captures/
+cube.json
+cube.md
+full.json
+full.md
+baseline_hashes.txt
 
 # 与本次工具无关的外部工具输出
 graphify-out/
-
-# 个人信息文件不入库
 
 # Python
 __pycache__/
