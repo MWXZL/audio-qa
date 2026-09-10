@@ -87,14 +87,19 @@ def cut_evidence(media: Path, ffmpeg: str, rows: Sequence[dict[str, Any]], out_d
     return written
 
 
-def voice_baseline_tsv(rows: Sequence[dict[str, Any]]) -> str:
-    """语音侧基线：`asr_align` 的表头，**语音起止预填**，字幕与文本待人工补。"""
+def voice_baseline_tsv(rows: Sequence[dict[str, Any]], media_name: str = "") -> str:
+    """语音侧基线：`asr_align` 的表头，**语音起止预填**，字幕与文本待人工补。
+
+    备注里写「在本段音轨的第几秒」而不是切好的片段文件名：片段是随时可再切的工作副本，
+    而时间码是可复现的引用——报告里只留后者。
+    """
     header = "\t".join(("句号", "语音起", "语音止", "字幕出现", "字幕消失", "字幕原文", "备注"))
     lines = [header]
     for index, row in enumerate(rows, 1):
+        span = f"{row['start']:.2f}–{row['end']:.2f} s"
         lines.append("\t".join((
             f"V-{index:02d}", f"{row['start']:.3f}", f"{row['end']:.3f}", "", "", "",
-            f"截图 {row.get('shot', '—')}（画面里应有对应文本）；音频 {row.get('clip', '—')}",
+            f"在 {media_name or '本段音轨'} 的 {span}；截图 {row.get('shot', '—')}",
         )))
     return "\n".join(lines) + "\n"
 
@@ -148,8 +153,13 @@ def overlap_seconds(a: dict[str, float], b: dict[str, float]) -> float:
 
 
 def crosscheck(states: Sequence[dict[str, Any]], segments: Sequence[dict[str, float]],
-               duration_s: float, gap_tolerance: float = 0.35) -> dict[str, Any]:
-    """逐条文本状态找它的语音活动，并列出四类事实。纯函数。"""
+               duration_s: float, gap_tolerance: float = 0.35,
+               has_timeline: bool = True) -> dict[str, Any]:
+    """逐条文本状态找它的语音活动，并列出四类事实。纯函数。
+
+    `has_timeline=False`（没传文本时间线）时**不做反向比对**：没有文本侧就谈不上
+    「语音缺文本」，否则每一个活动段都会被报成差异——那是噪音，不是发现。
+    """
     rows: list[dict[str, Any]] = []
     for index, state in enumerate(states, 1):
         start, end = float(state["start"]), float(state["end"])
@@ -172,8 +182,8 @@ def crosscheck(states: Sequence[dict[str, Any]], segments: Sequence[dict[str, fl
             findings.append({"kind": "text_without_voice", "index": row["index"],
                              "at": row["text_start"],
                              "detail": f"文本 {row['text_start']}–{row['text_end']}s 内没有语音活动"})
-    # 反向：有活动、但没有任何文本状态覆盖它
-    for segment in segments:
+    # 反向：有活动、但没有任何文本状态覆盖它（没有文本侧时跳过，见 docstring）
+    for segment in (segments if has_timeline else []):
         if segment["end"] - segment["start"] < MIN_ACTIVITY_S:
             continue
         covered = max((overlap_seconds(segment, {"start": s["text_start"], "end": s["text_end"]})
@@ -192,9 +202,19 @@ def crosscheck(states: Sequence[dict[str, Any]], segments: Sequence[dict[str, fl
                              "detail": f"{earlier['end']:.2f}s → {later['start']:.2f}s 之间只有"
                                        f" {between * 1000:.0f} ms 静音（连读或叠音的候选）"})
     offsets = [row["offset_ms"] for row in rows if row["offset_ms"] is not None]
+    ordered = sorted(segments, key=lambda item: item["start"])
+    gaps = [round(later["start"] - earlier["end"], 3)
+            for earlier, later in zip(ordered, ordered[1:])]
     return {"rows": rows, "findings": findings,
             "offset_median_ms": sorted(offsets)[len(offsets) // 2] if offsets else None,
             "offset_range_ms": (min(offsets), max(offsets)) if offsets else None,
+            "gap_stats": {
+                "count": len(gaps),
+                "median_s": sorted(gaps)[len(gaps) // 2] if gaps else None,
+                "min_s": min(gaps) if gaps else None,
+                "within_100ms": sum(1 for gap in gaps if gap <= 0.1),
+                "within_350ms": sum(1 for gap in gaps if gap <= 0.35),
+            },
             "text_states": len(rows), "activity_segments": len(segments),
             "silence_share": round(1 - sum(s["end"] - s["start"] for s in segments)
                                    / duration_s, 3) if duration_s else 0.0}
@@ -213,12 +233,14 @@ def measure(media: Path, ffmpeg: str, noise_db: float = DEFAULT_NOISE_DB,
     return parse_silences(stderr)
 
 
-def render(result: dict[str, Any], media: Path, timeline: Path, dropout_ms: float,
+def render(result: dict[str, Any], media: Path, timeline: Path | None, dropout_ms: float,
            usable: bool) -> str:
     lines = [
         f"# 文本 × 语音活动 交叉检查：`{media.name}`",
         "",
-        f"- 文本时间线：`{timeline.name}`（由 `scripts/subtitle_track.py` 生成）；",
+        (f"- 文本时间线：`{timeline.name}`（由 `scripts/subtitle_track.py` 生成）；"
+         if timeline is not None
+         else "- 本次没有传文本时间线：只出「语音侧」结果（活动段 / 候选语音 / 截图 / 音频片段）；"),
         f"- 音频活动：`silencedetect` 门限 {dropout_ms:.0f} dB，静音占比"
         f" {result['silence_share'] * 100:.0f}%；",
         f"- 文本状态 {result['text_states']} 个、活动段 {result['activity_segments']} 个。",
@@ -241,6 +263,14 @@ def render(result: dict[str, Any], media: Path, timeline: Path, dropout_ms: floa
         low, high = result["offset_range_ms"]  # type: ignore[misc]
         lines += ["", f"文本起点与语音活动起点之差：中位 {result['offset_median_ms']} ms，"
                       f"范围 {low} ~ {high} ms。"]
+    stats = result.get("gap_stats") or {}
+    if stats.get("count"):
+        lines += ["", f"相邻活动段之间的静音：{stats['count']} 处，中位 "
+                      f"{stats['median_s']:.2f} s、最短 {stats['min_s']:.2f} s；"
+                      f"≤0.10 s 的 {stats['within_100ms']} 处、≤0.35 s 的 "
+                      f"{stats['within_350ms']} 处。",
+                  "（≤0.10 s 才是「几乎无缝」；0.1–0.35 s 更像正常句间停顿，"
+                  "所以判定叠音要看的是前一个数。）"]
     lines += ["", "## 需回听的候选", ""]
     if result["findings"]:
         lines += ["| 类别 | 位置(s) | 说明 |", "| --- | --- | --- |"]
@@ -265,7 +295,8 @@ def render(result: dict[str, Any], media: Path, timeline: Path, dropout_ms: floa
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="av_sync_check",
                                      description="文本时间线 × 音频活动段 的交叉检查")
-    parser.add_argument("--timeline", type=Path, required=True, help="subtitle_track 的 JSON")
+    parser.add_argument("--timeline", type=Path,
+                        help="subtitle_track 的 JSON；不给就只做「语音侧」（候选语音段 + 截图 + 音频）")
     parser.add_argument("--media", type=Path, required=True, help="对应的录像或音轨")
     parser.add_argument("--out", type=Path, required=True, help="产出目录")
     parser.add_argument("--noise-db", type=float, default=DEFAULT_NOISE_DB,
@@ -290,25 +321,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ffmpeg is None:
         print("需要 ffmpeg", file=sys.stderr)
         return 2
-    if not args.timeline.is_file():
-        print(f"时间线不存在：{args.timeline}", file=sys.stderr)
-        return 2
-    payload = json.loads(args.timeline.read_text(encoding="utf-8"))
+    payload: dict[str, Any] = {}
+    if args.timeline is not None:
+        if not args.timeline.is_file():
+            print(f"时间线不存在：{args.timeline}", file=sys.stderr)
+            return 2
+        payload = json.loads(args.timeline.read_text(encoding="utf-8"))
     try:
         duration, silences = measure(args.media, ffmpeg, args.noise_db, args.silence_s)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     segments = activity_segments(duration, silences)
-    result = crosscheck(payload.get("states", []), segments, duration)
+    result = crosscheck(payload.get("states", []), segments, duration,
+                        has_timeline=bool(payload.get("states")))
     usable = result["silence_share"] >= MIN_SILENCE_SHARE
     args.out.mkdir(parents=True, exist_ok=True)
     stem = args.media.stem
     voices = voice_candidates(segments, args.min_voice_s, args.max_voice_s)
     if args.crops or args.clips:
         cut_evidence(args.media, ffmpeg, voices, args.out, f"{args.tag or ''}")
-        (args.out / f"{stem}_语音基线.tsv").write_text(voice_baseline_tsv(voices),
-                                                       encoding="utf-8")
+        (args.out / f"{stem}_语音基线.tsv").write_text(
+            voice_baseline_tsv(voices, args.media.name), encoding="utf-8")
     (args.out / f"{stem}_交叉检查.json").write_text(
         json.dumps({"file": args.media.name, "duration": duration, "noise_db": args.noise_db,
                     "silence_s": args.silence_s, "silences": silences,

@@ -68,18 +68,35 @@ def brightness(band_frames: Any) -> list[float]:
 
 
 def band_score(brights: Sequence[float]) -> float:
-    """给一条横条打「像不像字幕条」的分。纯函数。
+    """一条横条的「亮暗对比幅度」：95 分位 − 5 分位。纯函数。
 
-    字幕条的特征是「平时几乎没有亮点、偶尔整行亮起来」，而血条/技能栏/小地图那种 UI
-    是**一直亮着**。所以取 95 分位与 25 分位的比值：字幕条接近无穷（低分位≈0），
-    常亮 UI 接近 1。分母设下限是为了避免除以 0，以及给「一直很暗」的空条一个低分。
+    单独用它选横条会选错（底部的常亮边条幅度也很大），所以真正选条用的是
+    `band_quality`——**用切出来的状态是否合理**来验证候选，而不是只看信号强度。
     """
     if not brights:
         return 0.0
     values = sorted(brights)
-    low = values[int(len(values) * 0.25)]
-    high = values[int(len(values) * 0.95)]
-    return high / max(low, 0.05)
+    return max(0.0, values[int(len(values) * 0.95)] - values[int(len(values) * 0.05)])
+
+
+def band_quality(states: Sequence[dict[str, Any]], amplitude: float) -> float:
+    """候选横条的可信度：状态数与人话长度是否落在合理区间，再乘上对比幅度。纯函数。
+
+    为什么不能只看信号强度：实测底部有一条约 6% 高的常亮边条，它会偶尔抖暗，
+    幅度比真正的文本条还大——只看幅度就会选到它（r04/r06 就是这么错的，检出 1 个状态）。
+    而「横条切出来的状态」自带校验：文本条会给出若干个 0.4–20 s 的状态，
+    常亮条给出 1 个超长状态或几百个碎片，两者都被这个门槛挡住。
+    """
+    if not states or amplitude <= 0:
+        return 0.0
+    count = len(states)
+    if not 3 <= count <= 60:
+        return 0.0
+    durations = sorted(state["duration"] for state in states)
+    median = durations[len(durations) // 2]
+    if not 0.4 <= median <= 20.0:
+        return 0.0
+    return amplitude
 
 
 def candidate_bands(top: float = 0.55, bottom: float = 0.97, height: float = 0.06,
@@ -131,7 +148,10 @@ def _scaled_height(media: Path, ffmpeg: str, width: int) -> int:
     return len(done.stdout) // width
 
 
-def band_scores(frames: Any, bands: Sequence[tuple[float, float]] | None = None) -> list[dict[str, Any]]:
+def band_scores(frames: Any, bands: Sequence[tuple[float, float]] | None = None,
+                fps: float = 2.0, bright_floor: float | None = None,
+                change_threshold: float = MASK_CHANGE,
+                min_state_s: float = MIN_STATE_S) -> list[dict[str, Any]]:
     """在整屏缩略帧上给每条候选横条打分。纯函数（只依赖 numpy 数组）。"""
     import numpy as np
 
@@ -141,9 +161,18 @@ def band_scores(frames: Any, bands: Sequence[tuple[float, float]] | None = None)
         y0, y1 = int(top * height), max(int(bottom * height), int(top * height) + 1)
         band = frames[:, y0:y1, :]
         brights = (band > BRIGHT_PIXEL).mean(axis=(1, 2)) * 100.0
-        rows.append({"band": (top, bottom), "score": round(band_score(list(brights)), 2),
+        changes = np.zeros_like(brights)
+        masks = band > BRIGHT_PIXEL
+        if count > 1:
+            changes[1:] = (masks[1:] != masks[:-1]).mean(axis=(1, 2)) * 100.0
+        states = states_from_signals(list(brights), list(changes), fps, bright_floor,
+                                     change_threshold, min_state_s)
+        amplitude = band_score(list(brights))
+        rows.append({"band": (top, bottom), "amplitude": round(amplitude, 2),
+                     "states": len(states),
+                     "score": round(band_quality(states, amplitude), 2),
                      "peak": round(float(brights.max()), 2),
-                     "low": round(float(np.percentile(brights, 25)), 2)})
+                     "low": round(float(np.median(brights)), 2)})
     return rows
 
 
@@ -158,10 +187,14 @@ def choose_band(media: Path, ffmpeg: str, fps: float = 2.0, seconds: float = 40.
     评分依据见 `band_score`：字幕条「平时暗、偶尔整行亮」，常亮 UI 比值接近 1。
     """
     frames = probe_thumbnails(media, ffmpeg, fps, seconds, width)
-    table = band_scores(frames, candidate_bands(top, bottom, height, step))
+    table = band_scores(frames, candidate_bands(top, bottom, height, step), fps)
     if not table:
         raise RuntimeError("候选横条为空")
     best = max(table, key=lambda item: item["score"])
+    if best["score"] <= 0:
+        # 没有一条横条能切出合理的状态：退回「对比幅度最大」，并在产出里说明不可信
+        best = max(table, key=lambda item: item["amplitude"])
+        best["fallback"] = True
     return tuple(best["band"]), table  # type: ignore[return-value]
 
 
@@ -329,20 +362,25 @@ def render(media: Path, states: Sequence[dict[str, Any]], fps: float,
         "",
     ]
     if band_table:
-        best = max(band_table, key=lambda item: item["score"])
+        best = max(band_table, key=lambda item: (item["score"], item["amplitude"]))
         lines += [
             "## 为什么选这条横条",
             "",
-            "字幕条的特征是「平时几乎没有亮点、偶尔整行亮起」，常亮的血条 / 技能栏 / 小地图不是。"
-            "评分 = 亮占比 95 分位 / 25 分位（越低分位接近 0 越像字幕条）。",
+            "选择标准不是「信号最强」，而是**这条横条切出来的状态是否像一句句文本**：",
+            "状态数落在 3–60、状态时长中位数落在 0.4–20 s，再乘上亮暗对比幅度。",
+            "只看幅度会选到底部常亮的边条（实测踩过：r04/r06 选到 93–99% 的边条，只检出 1 个状态）。",
             "",
-            "| 横条（画面高度 %） | 评分 | 峰值亮占比(%) | 低分位亮占比(%) |",
-            "| --- | --- | --- | --- |",
+            "| 横条（画面高度 %） | 状态数 | 对比幅度 | 亮占比中位(%) | 峰值亮占比(%) |",
+            "| --- | --- | --- | --- | --- |",
         ]
-        for item in sorted(band_table, key=lambda row: -row["score"])[:5]:
+        for item in sorted(band_table, key=lambda row: (-row["score"], -row["amplitude"]))[:5]:
             mark = " ← 选用" if item["band"] == best["band"] else ""
             lines.append(f"| {item['band'][0] * 100:.0f}–{item['band'][1] * 100:.0f}{mark} |"
-                         f" {item['score']} | {item['peak']} | {item['low']} |")
+                         f" {item['states']} | {item['amplitude']} | {item['low']} |"
+                         f" {item['peak']} |")
+        if best.get("fallback"):
+            lines += ["", "> **警告**：没有横条能切出合理的状态，上表第一行只是「幅度最大」的兜底，"
+                          "本段的时间线**不可信**，不要引用。"]
         lines.append("")
     lines += [
         "| 序号 | 字幕出现(s) | 字幕消失(s) | 时长(s) | 亮度占比(%) | 截图 | 音频片段 |",
@@ -387,8 +425,10 @@ def process(media: Path, out_dir: Path, ffmpeg: str, args: argparse.Namespace,
     if args.auto_region:
         region, band_table = choose_band(media, ffmpeg, args.scan_fps, args.scan_seconds,
                                          step=args.scan_step)
+        chosen = max(band_table, key=lambda item: (item["score"], item["amplitude"]))
+        note = "（**没有可信候选，已退回对比幅度最大的横条**）" if chosen.get("fallback") else ""
         print(f"  自动选定的文本横条：画面高度 {region[0] * 100:.0f}%–{region[1] * 100:.0f}%"
-              f"（评分 {max(item['score'] for item in band_table):.2f}）")
+              f"（状态 {chosen['states']} 个 · 幅度 {chosen['amplitude']}）{note}  {note}")
     brights, changes = probe_band(media, ffmpeg, region, args.fps, args.width)
     states = states_from_signals(brights, changes, args.fps, args.bright_floor,
                                  args.change, args.min_state)

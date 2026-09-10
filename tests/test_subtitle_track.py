@@ -135,6 +135,19 @@ class BandChoiceTestCase(unittest.TestCase):
         hud_like = [2.0] * 100                       # 一直亮着
         self.assertGreater(st.band_score(subtitle_like), 10 * st.band_score(hud_like))
 
+    def test_quality_rejects_implausible_state_counts(self) -> None:
+        """状态数不合理（1 条超长、几百条碎片）的横条不能当选——这是选条的自校验。"""
+        one_long = [{"duration": 40.0}]
+        many_fragments = [{"duration": 0.1} for _ in range(200)]
+        plausible = [{"duration": 2.0} for _ in range(12)]
+        self.assertEqual(st.band_quality(one_long, 5.0), 0.0)
+        self.assertEqual(st.band_quality(many_fragments, 5.0), 0.0)
+        self.assertGreater(st.band_quality(plausible, 5.0), 0.0)
+
+    def test_quality_rejects_absurd_state_durations(self) -> None:
+        all_short = [{"duration": 0.2} for _ in range(10)]     # 中位 0.2 s：像噪声不像句
+        self.assertEqual(st.band_quality(all_short, 5.0), 0.0)
+
     def test_score_of_always_dark_band_is_low(self) -> None:
         """整条一直很暗（画面里没有这一带）不能拿高分，否则会选到空白的边角。"""
         self.assertLessEqual(st.band_score([0.0] * 100), 1.0)
@@ -170,7 +183,9 @@ class SyntheticVideoTestCase(unittest.TestCase):
         out = self.root / "auto"
         result = self.run_tool(video, out, ["--auto-region"])
         self.assertEqual(result["states"], len(LINES))
-        self.assertLessEqual(result["region"][0], 0.81)
+        # 合成录像里字幕画在画面高度约 81% 处；选中的横条必须盖住它（不必完全重合）
+        self.assertLess(result["region"][0], 0.90)
+        self.assertGreater(result["region"][1], 0.78)
         report = (out / "synthetic_字幕时间线.md").read_text(encoding="utf-8")
         self.assertIn("为什么选这条横条", report)
 
