@@ -88,6 +88,22 @@ class VideoCandidatesTestCase(unittest.TestCase):
         self.assertIn("monitor_capture", obs_setup.video_candidates(False))
 
 
+class AudioPlanTestCase(unittest.TestCase):
+    def test_default_uses_system_mix(self) -> None:
+        """实测：进程音频捕获在原神上电平异常低，默认必须用系统混音。"""
+        enable, mute = obs_setup.audio_plan("desktop")
+        self.assertIn("桌面", enable)
+        self.assertIn("游戏", mute)
+
+    def test_process_mode_swaps_them(self) -> None:
+        enable, mute = obs_setup.audio_plan("process")
+        self.assertIn("游戏", enable)
+        self.assertIn("桌面", mute)
+
+    def test_unknown_mode_falls_back_to_system_mix(self) -> None:
+        self.assertEqual(obs_setup.audio_plan(""), obs_setup.audio_plan("desktop"))
+
+
 class SettingsShapeTestCase(unittest.TestCase):
     def test_video_source_does_not_double_capture_audio(self) -> None:
         """画面源必须关掉自己的音频采集，否则声音会重复。"""

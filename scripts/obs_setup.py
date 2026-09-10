@@ -204,6 +204,21 @@ def video_candidates(fullscreen: bool) -> list[str]:
     return ["monitor_capture", "window_capture", "game_capture"]
 
 
+def audio_plan(mode: str) -> tuple[str, str]:
+    """返回 (要启用的音频源, 要静音的音频源)。
+
+    实测结论（原神 PC，本机 A/B 对照）：
+    - 桌面音频 / 系统混音（wasapi_output_capture）：-20.6 LUFS，正常；
+    - 应用程序音频捕获（wasapi_process_output_capture）：-57 ~ -68 LUFS，电平异常低。
+
+    系统混音里游戏声音是响的，说明问题出在进程捕获这条通路（多半与反作弊的会话重定向有关）。
+    因此默认用系统混音；代价是系统通知会一起进来，靠专注助手与关闭其它发声应用来隔离。
+    """
+    if mode == "process":
+        return ("游戏音频", "桌面音频")
+    return ("桌面音频", "游戏音频")
+
+
 class ObsClient:
     """极简 obs-websocket v5 客户端：只做请求/响应，够用即可。"""
 
@@ -264,7 +279,7 @@ class ObsClient:
             pass
 
 
-def configure(client: ObsClient) -> list[str]:
+def configure(client: ObsClient, audio_mode: str = "desktop") -> list[str]:
     notes: list[str] = []
     RECORD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -421,17 +436,38 @@ def configure(client: ObsClient) -> list[str]:
         client.call("RemoveInput", inputName=VIDEO_SOURCE)
         inputs = {item["inputName"]: item for item in client.call("GetInputList").get("inputs", [])}
 
-    # 桌面音频若不慎存在，静音掉，避免系统通知混进游戏轨道
-    for name, item in inputs.items():
-        if item.get("inputKind") == "wasapi_output_capture":
-            client.call("SetInputMute", inputName=name, inputMuted=True)
-            notes.append(f"已静音桌面音频源「{name}」（只用应用程序音频捕获）")
+    # 音频通路：按实测结论选（默认系统混音），启用的那个只写轨道 1，另一个静音避免叠声
+    enable_name, mute_name = audio_plan(audio_mode)
+    if enable_name not in inputs:
+        notes.append(f"!! 找不到音频源「{enable_name}」，请确认 OBS 的音频设备设置")
+    else:
+        client.call("SetInputMute", inputName=enable_name, inputMuted=False)
+        try:
+            client.call("SetInputAudioTracks", inputName=enable_name, inputAudioTracks=TRACK_ONE_ONLY)
+            notes.append(f"音频用「{enable_name}」（{audio_mode}）· 只写轨道 1")
+        except Exception as exc:
+            notes.append(f"!! 音轨设置失败：{exc}")
+    if mute_name in inputs:
+        client.call("SetInputMute", inputName=mute_name, inputMuted=True)
+        notes.append(f"已静音「{mute_name}」，避免两路叠声")
+    notes.append("提示：用系统混音时，请开 Windows 专注助手并关掉其它发声应用（通知会一起被录进来）")
     return notes
 
 
 def verify(client: ObsClient, seconds: int, keep: bool) -> int:
-    before = client.call("GetRecordStatus").get("outputPath", "")
-    client.call("StartRecord")
+    # 连录时 OBS 可能还没从上一次停止中缓过来（StartRecord 返回 500），重试几次
+    last_error = ""
+    for attempt in range(4):
+        try:
+            client.call("StartRecord")
+            last_error = ""
+            break
+        except Exception as exc:
+            last_error = str(exc)[:80]
+            time.sleep(2.0)
+    if last_error:
+        print(f"  无法开始录制：{last_error}", file=sys.stderr)
+        return 2
     print(f"  开始录制，请**留在游戏里** {seconds} 秒（有操作更好）…")
     time.sleep(seconds)
     stopped = client.call("StopRecord")
@@ -459,7 +495,6 @@ def verify(client: ObsClient, seconds: int, keep: bool) -> int:
         print("  已验证，测试录像已删除（加 --keep 保留）")
     elif not keep:
         print(f"  自检未通过，保留录像以便排查：{output}")
-    del before
     return 0 if verdict == "可用" else 1
 
 
@@ -468,6 +503,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("action", choices=["check", "configure", "verify", "all"])
     parser.add_argument("--seconds", type=int, default=12, help="验证录制时长")
     parser.add_argument("--keep", action="store_true", help="保留验证录像")
+    parser.add_argument("--audio", choices=["desktop", "process"], default="desktop",
+                        help="音频通路：desktop=系统混音（实测正常，默认）；"
+                             "process=应用程序音频捕获（本机实测电平异常低）")
     args = parser.parse_args(argv)
 
     try:
@@ -489,7 +527,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.action in {"configure", "all"}:
             print("\n配置：")
-            for note in configure(client):
+            for note in configure(client, args.audio):
                 print(f"  {note}")
         if args.action in {"verify", "all"}:
             print("\n验证：")
