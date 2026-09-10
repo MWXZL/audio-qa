@@ -24,8 +24,8 @@
 # 扫描素材库，输出 JSON（可作回归基线）+ Markdown（人读）
 python audio_qa.py scan <素材目录> --json out.json --md out.md
 
-# 查运行时录制里的断流（录制片段；0 = 关闭）
-python audio_qa.py scan captures/perf/clips --ext mkv,mp4 --dropout-min-ms 80 --md dropout.md
+# 查运行时录制里的断流（视频或纯音频都支持：mkv/mp4/mka/m4a/wav/flac；0 = 关闭）
+python audio_qa.py scan captures/perf/clips --ext mkv,mp4,mka --dropout-min-ms 80 --md dropout.md
 
 # 两次扫描的回归比较
 python audio_qa.py compare baseline.json current.json --md diff.md
